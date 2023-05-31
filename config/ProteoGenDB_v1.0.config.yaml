@@ -1,0 +1,38 @@
+#v1.0
+
+# General
+num_jobs: 16                                                                              # TSO500: 10, SAAVs: 24, COSMIC: 24
+num_job_chunks: 0                                                                         # if set to 0, job queue splitting is disabled, recommended for generating of a COSMIC database (min: 0, max: num_jobs, cosmic: num_jobs/4)
+var_seq_length: 30                                                                        # AAs before and after an SAAV
+enzyme_specificity: ".(?:(?<![KR]).)*"                                                    # enzyme specificity (trypsin: .(?:(?<![KR](?!P)).)*, stricttrypsin: .(?:(?<![KR]).)*)
+min_spec_pep_len: 7                                                                       # min. length of reported variants
+max_spec_pep_len: 30                                                                      # max. length of reported variants
+keep_saav_dups_in_fasta: False                                                            # True: keep all duplicates, False: keep only first occurance of a peptide
+filter_seq_with_reference: True                                                           # filter SAAV sequences against the provided reference proteome
+filter_seq_with_reference_add_no_ids: False                                               # entries with no UniProt identifier will not be filtered out if set to True
+output_protein_seq: False                                                                 # add column with full protein sequence for mapped exon sequences
+add_disease_info: True                                                                    # add disease information from EBI variants to FASTA header of variants
+
+# Reference data
+annotation_data: "./input/annotation/"                                                    # path to annotation data folder (for EBI API requests)
+fasta_ensembl: "./input/combined_Homo_sapiens.GRCh38.pep.all.fa"                          # ENSEMBL database, don't change (use ensembl_merger.py to generate one)
+reference_dataset: ""                                                                     # first search results
+reference_proteome: "./input/UP000005640_9606.fasta"                                      # reference proteome (subFASTA f.e.)
+generate_subFASTA: True                                                                   # generate subFASTA and append variant peptides to it
+
+# Input sources for variant database generation
+# Note: Can be enabled together, but it is recommended that only one of the options is enabled
+# Get Galaxy SAAVs
+map_galaxy: False                                                                         # if set to True, SAAVs from the provided Galaxy proteoform fasta will be reported
+fasta_proteogen_path: ""                                                                  # Galaxy proteoform FASTA
+
+# Get COSMIC SAAVs
+map_cosmic: False                                                                         # if set to True, SAAVs from the provided COSMIC database will be reported
+cosmic_mutant_export: ""                                                                  # path to CosmicMutantExport.tsv
+cosmic_primary_site_filter: True                                                          # enables filter for primary sites
+cosmic_primary_site_set: "pancreas"                                                       # name of primary site
+
+# Get TSO500 SAAVs
+map_tso: False                                                                            # if set to True, SAAVs from the provided TSO500 data will be reported
+tso_path: ""                                                                              # path to CombinedVariantOutput.tsv
+
