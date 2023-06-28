@@ -12,6 +12,7 @@ import multiprocessing
 import requests
 import logging
 import json
+import platform
 from pyarrow import feather
 from requests.exceptions import ConnectionError
 from argparse import ArgumentParser
@@ -45,7 +46,8 @@ warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
 
 
 def print_welcome():
-    os.system("color")
+    if platform.system() == 'Windows':
+        os.system("color")
     log.info(r"""
   _____           _              _____            _____  ____  
  |  __ \         | |            / ____|          |  __ \|  _ \ 
