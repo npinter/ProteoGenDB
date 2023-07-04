@@ -57,7 +57,7 @@ def print_welcome():
  |_|   |_|  \___/ \__\___|\___/ \_____|\___|_| |_|_____/|____/                              
 """)
     log.info(" Niko Pinter - https://github.com/npinter/ProteoGenDB")
-    log.info(" v1.1 \n")
+    log.info(" v1.1.1 \n")
 
 
 def multi_process(func, input_df, unit, *args):
@@ -263,6 +263,11 @@ def subset_fasta_db(fasta_db, exp_mat):
     fasta_subset = fasta_df_temp[fasta_df_temp["Identifier"].isin(id_subset.tolist())]
 
     return fasta_subset
+
+
+def write_fasta(df, out_path, time_str, fasta_type, in_src):
+    with open(os.path.join(out_path, "{}_{}_{}.fasta".format(time_str, fasta_type, in_src)), "w") as fasta_file:
+        SeqIO.write(df, fasta_file, "fasta")
 
 
 def read_tso(tso_path):
@@ -946,14 +951,14 @@ if __name__ == "__main__":
         proteogen_saavs = annotate_saavs(fasta_proteogen, config_yaml)
 
         # keep proteins which are present in reference dataset if provided
-        if config_yaml["reference_dataset"]:
+        if config_yaml["reference_dataset"] != "":
             log.info("Filter UniProt IDs with reference dataset..")
             proteogen_saavs = filter_id_with_reference(proteogen_saavs, config_yaml)
 
         # filter sequences against reference proteome
         if config_yaml["filter_seq_with_reference"]:
             log.info("Filter variant sequences with reference proteome..")
-            if config_yaml["generate_subFASTA"]:
+            if config_yaml["generate_subFASTA"] and config_yaml["reference_dataset"] != "":
                 log.info("Generate subFASTA proteome..")
                 fasta_proteome = subset_fasta_db(config_yaml["reference_proteome"],
                                                  config_yaml["reference_dataset"])
@@ -977,6 +982,8 @@ if __name__ == "__main__":
                 proteogen_saavs_var_temp = pd.read_hdf(h5_path,
                                                        h5_path_key)
                 proteogen_saavs = pd.concat([proteogen_saavs, proteogen_saavs_var_temp])
+        else:
+            fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
 
         # add disease information
         if config_yaml["add_disease_info"]:
@@ -996,24 +1003,22 @@ if __name__ == "__main__":
                                                       config_yaml["keep_saav_dups_in_fasta"])
 
         # write to FASTA
-        log.info("Save annotated SAAVs as FASTA..")
-        with open(os.path.join(output_path,
-                               "{}_SAAV_sequences_galaxy.fasta".format(timestamp_str)), "w") as fasta_out:
-            SeqIO.write(proteogen_saavs_list, fasta_out, "fasta")
+        log.info("Save annotated Galaxy SAAVs as FASTA..")
+        write_fasta(proteogen_saavs_list, output_path, timestamp_str, "SAAV_sequences", "galaxy")
+
+        fasta_proteome_name = os.path.basename(config_yaml["reference_proteome"]).split(".")[0]
+        fasta_output = convert_df_to_bio_list(fasta_proteome, "uniprot")
+        fasta_combined_output = fasta_output + proteogen_saavs_list
 
         if config_yaml["generate_subFASTA"]:
             log.info("Save subFASTA proteome..")
-            fasta_proteome_name = os.path.basename(config_yaml["reference_proteome"]).split(".")[0]
-            sub_fasta_output = convert_df_to_bio_list(fasta_proteome, "uniprot")
-            with open(os.path.join(output_path,
-                                   "{}_{}_subFASTA_galaxy.fasta".format(timestamp_str,
-                                                                        fasta_proteome_name)), "w") as fasta_out:
-                SeqIO.write(sub_fasta_output, fasta_out, "fasta")
-            with open(os.path.join(output_path,
-                                   "{}_{}_subFASTA_SAAV_galaxy.fasta".format(timestamp_str,
-                                                                             fasta_proteome_name)), "w") as fasta_saav:
-                sub_fasta_saav_output = sub_fasta_output + proteogen_saavs_list
-                SeqIO.write(sub_fasta_saav_output, fasta_saav, "fasta")
+
+            write_fasta(fasta_output, output_path, timestamp_str, "subFASTA", "galaxy")
+            write_fasta(fasta_combined_output, output_path, timestamp_str, "subFASTA_SAAV", "galaxy")
+        else:
+            log.info("Save FASTA proteome..")
+            write_fasta(fasta_combined_output, output_path, timestamp_str, "FASTA_SAAV", "galaxy")
+
 
     if config_yaml["map_cosmic"]:
         # get ensembl fasta
@@ -1163,14 +1168,14 @@ if __name__ == "__main__":
                                                 ])
 
         # keep proteins which are present in reference dataset if provided
-        if config_yaml["reference_dataset"]:
+        if config_yaml["reference_dataset"] != "":
             log.info("Filter UniProt IDs with reference dataset..")
             cosmic_data_ensp_filt_var = filter_id_with_reference(cosmic_data_ensp_filt_var, config_yaml)
 
         # filter sequences against reference proteome
         if config_yaml["filter_seq_with_reference"]:
             log.info("Filter variant sequences with reference proteome..")
-            if config_yaml["generate_subFASTA"]:
+            if config_yaml["generate_subFASTA"] and config_yaml["reference_dataset"] != "":
                 log.info("Generate subFASTA proteome..")
                 fasta_proteome = subset_fasta_db(config_yaml["reference_proteome"],
                                                  config_yaml["reference_dataset"])
@@ -1194,6 +1199,8 @@ if __name__ == "__main__":
                 cosmic_data_ensp_filt_var_temp = pd.read_hdf(h5_path,
                                                              h5_path_key)
                 cosmic_data_ensp_filt_var = pd.concat([cosmic_data_ensp_filt_var, cosmic_data_ensp_filt_var_temp])
+        else:
+            fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
 
         # add disease information
         if config_yaml["add_disease_info"]:
@@ -1213,23 +1220,21 @@ if __name__ == "__main__":
                                                                 config_yaml["keep_saav_dups_in_fasta"])
 
         # write to FASTA
-        log.info("Save annotated COSMIC variants as FASTA..")
-        with open(os.path.join(output_path, "{}_SAAV_sequences_cosmic.fasta".format(timestamp_str)), "w") as fasta_out:
-            SeqIO.write(cosmic_data_ensp_filt_var_list, fasta_out, "fasta")
+        log.info("Save annotated COSMIC SAAVs as FASTA..")
+        write_fasta(cosmic_data_ensp_filt_var_list, output_path, timestamp_str, "SAAV_sequences", "cosmic")
+
+        fasta_proteome_name = os.path.basename(config_yaml["reference_proteome"]).split(".")[0]
+        fasta_output = convert_df_to_bio_list(fasta_proteome, "uniprot")
+        fasta_combined_output = fasta_output + cosmic_data_ensp_filt_var_list
 
         if config_yaml["generate_subFASTA"]:
             log.info("Save subFASTA proteome..")
-            fasta_proteome_name = os.path.basename(config_yaml["reference_proteome"]).split(".")[0]
-            sub_fasta_output = convert_df_to_bio_list(fasta_proteome, "uniprot")
-            with open(os.path.join(output_path,
-                                   "{}_{}_subFASTA.fasta_cosmic".format(timestamp_str,
-                                                                        fasta_proteome_name)), "w") as fasta_out:
-                SeqIO.write(sub_fasta_output, fasta_out, "fasta")
-            with open(os.path.join(output_path,
-                                   "{}_{}_subFASTA_SAAV.fasta_cosmic".format(timestamp_str,
-                                                                             fasta_proteome_name)), "w") as fasta_saav:
-                sub_fasta_saav_output = sub_fasta_output + cosmic_data_ensp_filt_var_list
-                SeqIO.write(sub_fasta_saav_output, fasta_saav, "fasta")
+
+            write_fasta(fasta_output, output_path, timestamp_str, "subFASTA", "cosmic")
+            write_fasta(fasta_combined_output, output_path, timestamp_str, "subFASTA_SAAV", "cosmic")
+        else:
+            log.info("Save FASTA proteome..")
+            write_fasta(fasta_combined_output, output_path, timestamp_str, "FASTA_SAAV", "cosmic")
 
     if config_yaml["map_tso"]:
         log.info("Load CombinedVariantOutput of TSO 500 pipeline..")
@@ -1271,14 +1276,14 @@ if __name__ == "__main__":
         tso_data_processed["UniProtID"] = tso_data_processed["UniProtID"].replace("", "NoUniID")
 
         # keep proteins which are present in reference dataset if provided
-        if config_yaml["reference_dataset"]:
+        if config_yaml["reference_dataset"] != "":
             log.info("Filter UniProt IDs with reference dataset..")
             tso_data_processed = filter_id_with_reference(tso_data_processed, config_yaml)
 
         # filter sequences against reference proteome
         if config_yaml["filter_seq_with_reference"]:
             log.info("Filter variant sequences with reference proteome..")
-            if config_yaml["generate_subFASTA"]:
+            if config_yaml["generate_subFASTA"] and config_yaml["reference_dataset"] != "":
                 log.info("Generate subFASTA proteome..")
                 fasta_proteome = subset_fasta_db(config_yaml["reference_proteome"],
                                                  config_yaml["reference_dataset"])
@@ -1302,6 +1307,8 @@ if __name__ == "__main__":
                 tso_data_processed_var_temp = pd.read_hdf(h5_path,
                                                           h5_path_key)
                 tso_data_processed = pd.concat([tso_data_processed, tso_data_processed_var_temp])
+        else:
+            fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
 
         # add disease information
         if config_yaml["add_disease_info"]:
@@ -1322,23 +1329,20 @@ if __name__ == "__main__":
 
         # write to FASTA
         log.info("Save annotated TSO SAAVs as FASTA..")
-        with open(os.path.join(output_path,
-                               "{}_SAAV_sequences_tso.fasta".format(timestamp_str)), "w") as fasta_out:
-            SeqIO.write(tso_data_processed_list, fasta_out, "fasta")
+        write_fasta(tso_data_processed_list, output_path, timestamp_str, "SAAV_sequences", "tso")
+
+        fasta_proteome_name = os.path.basename(config_yaml["reference_proteome"]).split(".")[0]
+        fasta_output = convert_df_to_bio_list(fasta_proteome, "uniprot")
+        fasta_combined_output = fasta_output + tso_data_processed_list
 
         if config_yaml["generate_subFASTA"]:
             log.info("Save subFASTA proteome..")
-            fasta_proteome_name = os.path.basename(config_yaml["reference_proteome"]).split(".")[0]
-            sub_fasta_output = convert_df_to_bio_list(fasta_proteome, "uniprot")
-            with open(os.path.join(output_path,
-                                   "{}_{}_subFASTA_tso.fasta".format(timestamp_str,
-                                                                     fasta_proteome_name)), "w") as fasta_out:
-                SeqIO.write(sub_fasta_output, fasta_out, "fasta")
-            with open(os.path.join(output_path,
-                                   "{}_{}_subFASTA_SAAV_tso.fasta".format(timestamp_str,
-                                                                          fasta_proteome_name)), "w") as fasta_saav:
-                sub_fasta_saav_output = sub_fasta_output + tso_data_processed_list
-                SeqIO.write(sub_fasta_saav_output, fasta_saav, "fasta")
+
+            write_fasta(fasta_output, output_path, timestamp_str, "subFASTA", "tso")
+            write_fasta(fasta_combined_output, output_path, timestamp_str, "subFASTA_SAAV", "tso")
+        else:
+            log.info("Save FASTA proteome..")
+            write_fasta(fasta_combined_output, output_path, timestamp_str, "FASTA_SAAV", "tso")
 
     end_time = time.time()
     log.info("Runtime (total): {}min".format(str(round((end_time - start_time) / 60, 2))))
