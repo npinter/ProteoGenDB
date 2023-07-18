@@ -756,13 +756,19 @@ def process_mutation(df, df_status, jid, p_bar_val, *_):
     for i_seq, seq in df.iterrows():
         var_pos = int(seq.VariantPos[0][1:-1])
         var_sub = seq.VariantPos[0][-1]
+        var_aa = seq.VariantPos[0][0]
 
-        if not var_sub == "-" and not var_sub == "*":
-            df["SequenceMut"].loc[i_seq] = seq.Sequence[:var_pos - 1] + var_sub + seq.Sequence[var_pos:]
-        elif var_sub == "*":
-            df["SequenceMut"].loc[i_seq] = seq.Sequence[:var_pos - 1]
-        elif var_sub == "-":
-            df["SequenceMut"].loc[i_seq] = seq.Sequence[:var_pos - 1] + seq.Sequence[var_pos:]
+        # keep only variants where consensus AA occurs is in sequence
+        # --> missmatch of mapped sequence (ENSEMBL (read_fasta, "ensembl") or NCBI (get_ncbi_fasta)
+        if seq.Sequence[var_pos - 1:var_pos][0] == var_aa:
+            if not var_sub == "-" and not var_sub == "*":
+                df["SequenceMut"].loc[i_seq] = seq.Sequence[:var_pos - 1] + var_sub + seq.Sequence[var_pos:]
+            elif var_sub == "*":
+                df["SequenceMut"].loc[i_seq] = seq.Sequence[:var_pos - 1]
+            elif var_sub == "-":
+                df["SequenceMut"].loc[i_seq] = seq.Sequence[:var_pos - 1] + seq.Sequence[var_pos:]
+        else:
+            df["SequenceMut"].loc[i_seq] = Seq("")
 
         # update progress bar
         p_bar_val[jid] = i_seq
