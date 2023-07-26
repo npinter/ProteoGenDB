@@ -794,16 +794,16 @@ def cleave_peptide(var_dict, cfg):
             if "#" in enz_group:
                 enz_group = enz_group.replace("#", "")
 
-            enz_peptide = Seq(enz_group)
-
-            return enz_peptide
-        else:
-            enz_peptide = None
+                return Seq(enz_group)
+            else:
+                return None
     if not enz_spec:
-        enz_peptide = None
+        return None
 
-    return enz_peptide
+    if full_protein:
+        return cleaved_peptides
 
+    return None
 
 def filter_id_with_reference(input_df, cfg):
     input_df_noid = input_df[input_df["UniProtID"] == "NoUniID"]
@@ -1024,7 +1024,6 @@ if __name__ == "__main__":
         else:
             log.info("Save FASTA proteome..")
             write_fasta(fasta_combined_output, output_path, timestamp_str, "FASTA_SAAV", "galaxy")
-
 
     if config_yaml["map_cosmic"]:
         # get ensembl fasta
