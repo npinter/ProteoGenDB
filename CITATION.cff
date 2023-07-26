@@ -5,6 +5,6 @@ authors:
   given-names: "Niko"
   orcid: "https://orcid.org/0000-0002-8241-6821"
 title: "ProteoGenDB"
-version: 1.1.1
+version: 1.2.0
 date-released: 2023-05-31
 url: "https://github.com/npinter/ProteoGenDB"
