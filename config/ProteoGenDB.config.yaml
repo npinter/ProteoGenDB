@@ -36,3 +36,8 @@ cosmic_primary_site_set: "pancreas"                                             
 map_tso: False                                                                            # if set to True, SAAVs from the provided TSO500 data will be reported
 tso_path: ""                                                                              # path to CombinedVariantOutput.tsv
 
+# Generate Isoform
+map_isoforms: False                                                                       # if set to True, isoforms from provided data will be reported
+fasta_isoforms_path: ""                                                                   # path to isoform fasta (Uniprot)
+drop_unreviewed_isoforms: True                                                            # if set to True, unreviewed isoforms will be ignored (starting with tr)
+drop_unmapped_isoforms: True                                                              # if set to True, isoforms without a corresponding consensus ID will be ignored

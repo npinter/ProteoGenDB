@@ -736,7 +736,7 @@ def process_saavs(df, df_status, jid, p_bar_val, *args):
                 post_x = ["#" * (2 * var_seq_len + 1 - (pos_end-pos_start))
                           if aa_pos + var_seq_len + 1 > seq_pos_last else ""][0]
                 var_seq_temp[p] = pre_x + pos.Sequence[pos_start:pos_end] + post_x
-                var_seq_cleave_temp[p] = cleave_peptide(var_seq_temp[p], cfg)
+                var_seq_cleave_temp[p] = cleave_sequence(var_seq_temp[p], cfg)
         df["VarSeq"].loc[pos.Index] = [var_seq_temp]
         df["VarSeqCleave"].loc[pos.Index] = [var_seq_cleave_temp]
 
@@ -747,6 +747,33 @@ def process_saavs(df, df_status, jid, p_bar_val, *args):
     df = df[df["VarSeq"].str[0] != {}]
 
     df_status[jid] = df
+
+
+def process_isoforms(df, df_status, jid, p_bar_val, *args):
+    cfg = args[0][0]
+
+    iso_seq_cleave_temp = {}
+
+    for iso in df.itertuples():
+        # cleave isoform
+        iso_seq_cleave_temp[iso.Identifier] = cleave_sequence(iso.Sequence, cfg, full_protein=True)
+
+        # update progress bar value process-wise
+        p_bar_val[jid] = iso.Index
+
+    # transform into dataframe
+    df_new = pd.Series(iso_seq_cleave_temp).to_frame().reset_index()
+    df_new.columns = ["UniProtID", "VarSeqCleave"]
+
+    if cfg["drop_unmapped_isoforms"]:
+        df_new = pd.merge(df_new, df[['Identifier', 'Consensus']],
+                          left_on='UniProtID',
+                          right_on='Identifier',
+                          how='left')
+
+        df_new = df_new.drop('Identifier', axis=1)
+
+    df_status[jid] = df_new
 
 
 def process_mutation(df, df_status, jid, p_bar_val, *_):
@@ -778,21 +805,25 @@ def process_mutation(df, df_status, jid, p_bar_val, *_):
     df_status[jid] = df
 
 
-def cleave_peptide(var_dict, cfg):
+def cleave_sequence(var_dict, cfg, full_protein=False):
     regex = re.compile(cfg["enzyme_specificity"])
 
     enz_spec = [(str(var_dict).index(enz_match) + 1, str(var_dict).index(enz_match) + len(enz_match), enz_match)
                 for enz_match in regex.findall(str(var_dict))]
 
-    enz_peptide = None
+    cleaved_peptides = []
 
     for e in enz_spec:
         enz_pos_low, enz_pos_high, enz_group = e
 
-        if enz_pos_low <= cfg["var_seq_length"] + 1 <= enz_pos_high:
-            # remove # from N- or C- terminal peptides
-            if "#" in enz_group:
-                enz_group = enz_group.replace("#", "")
+        if full_protein:
+            if cfg["min_spec_pep_len"] <= enz_pos_high - enz_pos_low + 1 <= cfg["max_spec_pep_len"]:
+                cleaved_peptides.append(Seq(enz_group))
+        else:
+            if enz_pos_low <= cfg["var_seq_length"] + 1 <= enz_pos_high:
+                # remove # from N- or C- terminal peptides
+                if "#" in enz_group:
+                    enz_group = enz_group.replace("#", "")
 
                 return Seq(enz_group)
             else:
@@ -805,8 +836,9 @@ def cleave_peptide(var_dict, cfg):
 
     return None
 
-def filter_id_with_reference(input_df, cfg):
-    input_df_noid = input_df[input_df["UniProtID"] == "NoUniID"]
+
+def filter_id_with_reference(input_df, cfg, column_str="UniProtID"):
+    input_df_noid = input_df[input_df[column_str] == "NoUniID"]
 
     with open(cfg["reference_dataset"]) as ref:
         ref_df_sep = pd.read_table(ref, sep=None, iterator=True, engine="python")
@@ -815,7 +847,7 @@ def filter_id_with_reference(input_df, cfg):
 
     ref_list = ref_df.iloc[:, 0].tolist()
 
-    output_df_temp = input_df[input_df['UniProtID'].isin(ref_list)]
+    output_df_temp = input_df[input_df[column_str].isin(ref_list)]
     if cfg["filter_seq_with_reference_add_no_ids"]:
         output_df = pd.concat([output_df_temp, input_df_noid])
     else:
@@ -854,7 +886,7 @@ def convert_df_to_bio_list(pd_seq, seq_format, min_pep_len=None, max_pep_len=Non
     seq_dups = []
     var_header = None
 
-    if seq_format == "galaxy" or seq_format == "cosmic" or seq_format == "tso":
+    if seq_format == "galaxy" or seq_format == "cosmic" or seq_format == "tso" or seq_format == "isoform":
         for i_var_pep, var_pep in pd_seq.VarSeqCleave.items():
             var_counter = 1
             var_seq_last = None
@@ -891,6 +923,12 @@ def convert_df_to_bio_list(pd_seq, seq_format, min_pep_len=None, max_pep_len=Non
                             var_pos,
                             var_counter,
                             pd_seq.ProteinID.loc[i_var_pep])
+                    elif seq_format == "isoform":
+                        # FASTA header: sp|UniProtID_PepID|RefSeq_Protein
+                        var_header = "sp|{}_{}{}".format(
+                            pd_seq.UniProtID.loc[i_var_pep],
+                            var_pos,
+                            [f"|{pd_seq.Consensus.loc[i_var_pep]}" if "Consensus" in pd_seq.columns else ""][0])
                     record = SeqRecord(var_seq, var_header, '', '')
                     seq_records.append(record)
                     seq_dups.append(str(var_seq))
@@ -1348,6 +1386,114 @@ if __name__ == "__main__":
         else:
             log.info("Save FASTA proteome..")
             write_fasta(fasta_combined_output, output_path, timestamp_str, "FASTA_SAAV", "tso")
+
+    if config_yaml["map_isoforms"]:
+        # read related isoforms
+        fasta_isoforms = read_fasta(config_yaml["fasta_isoforms_path"], "uniprot")
+
+        # only keep "Isoform of"
+        if config_yaml["drop_unmapped_isoforms"]:
+            fasta_isoforms = fasta_isoforms[fasta_isoforms.Description.str.contains("Isoform of")]
+            fasta_isoforms['Consensus'] = fasta_isoforms.Description.str.extract('Isoform of (\w+),')
+
+        # drop unreviewed
+        if config_yaml["drop_unreviewed_isoforms"]:
+            fasta_isoforms = fasta_isoforms[~fasta_isoforms['Description'].str.startswith('tr')]
+
+        # digest isoforms to peptides
+        fasta_df_iso = multi_process("process_isoforms", fasta_isoforms, "isoforms", config_yaml)
+
+        # deduplicate peptides (intrinsically)
+        fasta_df_iso_exp = fasta_df_iso.explode('VarSeqCleave')
+        fasta_df_iso_unique = fasta_df_iso_exp.drop_duplicates(subset=['VarSeqCleave']).dropna(subset=['VarSeqCleave'])
+
+        # aggregating "VarSeqCleave" into a list
+        if config_yaml["drop_unmapped_isoforms"]:
+            fasta_df_iso_grouped = fasta_df_iso_unique.groupby("UniProtID").agg(
+                {"VarSeqCleave": list, "Consensus": "first"}
+            ).reset_index()
+        else:
+            fasta_df_iso_grouped = fasta_df_iso_unique.groupby("UniProtID").agg(
+                {"VarSeqCleave": list}
+            ).reset_index()
+
+        def sequences_to_dicts(sequences):
+            return [{i + 1: seq} for i, seq in enumerate(sequences)]
+
+        fasta_df_iso_grouped["VarSeqCleave"] = fasta_df_iso_grouped["VarSeqCleave"].apply(sequences_to_dicts)
+
+        fasta_df_iso_dict = fasta_df_iso_grouped.explode('VarSeqCleave').reset_index(drop=True)
+        fasta_df_iso_dict["VarSeqCleave"] = fasta_df_iso_dict["VarSeqCleave"].apply(lambda x: [x])
+
+        # keep isoforms which are present in reference dataset if provided
+        if config_yaml["reference_dataset"] != "" and config_yaml["drop_unmapped_isoforms"]:
+            log.info("Filter Isoforms with reference dataset..")
+            fasta_df_iso_dict = filter_id_with_reference(fasta_df_iso_dict, config_yaml, "Consensus")
+
+        # ToDo: write function
+        # filter sequences against reference proteome
+        if config_yaml["filter_seq_with_reference"]:
+            log.info("Filter variant sequences with reference proteome..")
+            if config_yaml["generate_subFASTA"] and config_yaml["reference_dataset"] != "":
+                log.info("Generate subFASTA proteome..")
+                fasta_proteome = subset_fasta_db(config_yaml["reference_proteome"],
+                                                 config_yaml["reference_dataset"])
+            else:
+                fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
+
+            # create temp folder
+            if not os.path.exists(os.path.join(output_path, "temp")):
+                os.mkdir(os.path.join(output_path, "temp"))
+
+            var_data_processed_h5 = multi_process("filter_seq_with_reference",
+                                                  fasta_df_iso_dict,
+                                                  "sequences",
+                                                  fasta_proteome,
+                                                  output_path)
+
+            var_data_processed = pd.DataFrame()
+
+            for h5_path in var_data_processed_h5:
+                h5_path_key = os.path.splitext(os.path.basename(h5_path))[0]
+                var_data_processed_var_temp = pd.read_hdf(h5_path,
+                                                          h5_path_key)
+                var_data_processed = pd.concat([var_data_processed, var_data_processed_var_temp])
+        else:
+            fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
+
+        # rank peptides per occurance in isoform
+        var_data_processed['VarSeqCleave'] = var_data_processed['VarSeqCleave'].apply(
+            lambda x: list(x[0].values())[0]
+        )
+        var_data_processed['Order'] = var_data_processed.groupby('UniProtID').cumcount() + 1
+        var_data_processed['VarSeqCleave'] = var_data_processed.apply(
+            lambda x: [{x['Order']: x['VarSeqCleave']}], axis=1
+        )
+        var_data_processed.drop('Order', axis=1, inplace=True)
+
+        # mapped SAAVS to FASTA
+        iso_data_processed_list = convert_df_to_bio_list(var_data_processed,
+                                                         "isoform",
+                                                         config_yaml["min_spec_pep_len"],
+                                                         config_yaml["max_spec_pep_len"],
+                                                         config_yaml["keep_saav_dups_in_fasta"])
+
+        # write to FASTA
+        log.info("Save isoform peptides as FASTA..")
+        write_fasta(iso_data_processed_list, output_path, timestamp_str, "isoform_sequences", "iso")
+
+        fasta_proteome_name = os.path.basename(config_yaml["reference_proteome"]).split(".")[0]
+        fasta_output = convert_df_to_bio_list(fasta_proteome, "uniprot")
+        fasta_combined_output = fasta_output + iso_data_processed_list
+
+        if config_yaml["generate_subFASTA"]:
+            log.info("Save subFASTA proteome..")
+
+            write_fasta(fasta_output, output_path, timestamp_str, "subFASTA", "iso")
+            write_fasta(fasta_combined_output, output_path, timestamp_str, "subFASTA_isoform_sequences", "iso")
+        else:
+            log.info("Save FASTA proteome..")
+            write_fasta(fasta_combined_output, output_path, timestamp_str, "FASTA_isoform_sequences", "iso")
 
     end_time = time.time()
     log.info("Runtime (total): {}min".format(str(round((end_time - start_time) / 60, 2))))
