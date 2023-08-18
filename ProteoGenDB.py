@@ -57,7 +57,7 @@ def print_welcome():
  |_|   |_|  \___/ \__\___|\___/ \_____|\___|_| |_|_____/|____/                              
 """)
     log.info(" Niko Pinter - https://github.com/npinter/ProteoGenDB")
-    log.info(" v1.2.0 \n")
+    log.info(" v1.2.1 \n")
 
 
 def multi_process(func, input_df, unit, *args):
@@ -811,6 +811,8 @@ def cleave_sequence(var_dict, cfg, full_protein=False):
     enz_spec = [(str(var_dict).index(enz_match) + 1, str(var_dict).index(enz_match) + len(enz_match), enz_match)
                 for enz_match in regex.findall(str(var_dict))]
 
+    enz_peptide = None
+
     cleaved_peptides = []
 
     for e in enz_spec:
@@ -825,16 +827,18 @@ def cleave_sequence(var_dict, cfg, full_protein=False):
                 if "#" in enz_group:
                     enz_group = enz_group.replace("#", "")
 
-                return Seq(enz_group)
+                enz_peptide = Seq(enz_group)
+
+                return enz_peptide
             else:
-                return None
-    if not enz_spec:
-        return None
+                enz_peptide = None
+        if not enz_spec:
+            enz_peptide = None
 
     if full_protein:
         return cleaved_peptides
 
-    return None
+    return enz_peptide
 
 
 def filter_id_with_reference(input_df, cfg, column_str="UniProtID"):
