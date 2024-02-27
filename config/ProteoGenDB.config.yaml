@@ -1,4 +1,4 @@
-#v1.2.1
+#v1.3
 
 # General
 num_jobs: 16                                                                              # TSO500: 10, SAAVs: 24, COSMIC: 24
@@ -11,7 +11,11 @@ keep_saav_dups_in_fasta: False                                                  
 filter_seq_with_reference: True                                                           # filter SAAV sequences against the provided reference proteome
 filter_seq_with_reference_add_no_ids: False                                               # entries with no UniProt identifier will not be filtered out if set to True
 output_protein_seq: False                                                                 # add column with full protein sequence for mapped exon sequences
+
+# Disease info & variant filtering
 add_disease_info: True                                                                    # add disease information from EBI variants to FASTA header of variants
+variant_reviewed_filter: ["UniProt"]                                                      # if list entry is present, only reviewed entries will be reported, keep empty ([]) to report all (Example ['Ensembl', 'ClinVar', 'UniProt', 'ClinGen', 'dbSNP', 'ExAC', 'gnomAD'])
+variant_evidences_cutoff: 0                                                               # if set to 0, no evidence filter is applied, otherwise only variants with at least the given number of evidences will be reported
 
 # Reference data
 annotation_data: "./input/annotation/"                                                    # path to annotation data folder (for EBI API requests)
@@ -41,3 +45,12 @@ map_isoforms: False                                                             
 fasta_isoforms_path: ""                                                                   # path to isoform fasta (Uniprot)
 drop_unreviewed_isoforms: True                                                            # if set to True, unreviewed isoforms will be ignored (starting with tr)
 drop_unmapped_isoforms: True                                                              # if set to True, isoforms without a corresponding consensus ID will be ignored
+
+# Read MFA
+map_mfa: False                                                                             # if set to True, SAAVs from the provided MFA file will be reported
+mfa_path: ""                                                                    # path to MFA file
+mfa_vaf_cutoff: 0.05                                                                      # Variant allel freuquency cutoff. Default is 5% (0.05)
+
+# UniProt SAAVs
+map_uniprot: False                                                                        # if set to True, SAAVs from the provided UniProt database will be reported
+use_uniprot_reviewed: True                                                                # if set to True, only reviewed entries will be reported
