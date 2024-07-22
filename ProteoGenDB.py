@@ -405,7 +405,7 @@ def fetch_fasta(pids, df_status, jid, p_bar_val, mode, *_):
 
     if mode[0] == "ncbi":
         for i_pid, pid in enumerate(pids):
-        # ToDo: check if temp database entry exists if not get from NCBI and write to disk
+            # ToDo: check if temp database entry exists if not get from NCBI and write to disk
             base_url = "https://www.ncbi.nlm.nih.gov/search/api/download-sequence/?db=protein&id={pid}&filename={pid}"
             prot_seq_rec = SeqIO.read(io.StringIO(requests.get(base_url.format(pid=pid)).text), "fasta").seq
             seq_records.append(prot_seq_rec)
@@ -1846,26 +1846,41 @@ if __name__ == "__main__":
         log.info("Processing SAAV list...")
         saav_list_data = read_saav_list(config_yaml["saav_list_path"])
 
-        # Get protein sequences
+        # get protein sequences
         log.info("Fetching protein sequences for SAAVs...")
-        saav_list_data['Sequence'] = multi_process("fetch_fasta", saav_list_data['UniProtID'].tolist(), "ids",
-                                                   "uniprot")
 
-        # Mutate sequences
+        # unique UniProt IDs
+        saav_list_data_uniprot_ids = saav_list_data["UniProtID"].drop_duplicates().tolist()
+
+        saav_list_data_sequences = multi_process("fetch_fasta",
+                                                 saav_list_data_uniprot_ids,
+                                                 "ids",
+                                                 "uniprot")
+
+        # merge saav_list_data_uniprot_ids and saav_list_data_sequences in dataframe
+        saav_list_data_sequences_df = pd.DataFrame(
+            list(zip(saav_list_data_uniprot_ids, saav_list_data_sequences)),
+            columns=["UniProtID", "Sequence"]
+        )
+
+        # merge saav_list_data and saav_list_data_sequences_df
+        saav_list_data = saav_list_data.merge(saav_list_data_sequences_df, on="UniProtID", how="left")
+
+        # mutate sequences
         log.info("Generating mutated sequences...")
         saav_list_data_mut = multi_process("process_mutation",
                                            saav_list_data,
                                            "SAAV list mutations",
                                            config_yaml)
 
-        # Process SAAVs
+        # process SAAVs
         log.info("Processing SAAV list mutations...")
         saav_list_data_processed = multi_process("process_saavs",
                                                  saav_list_data_mut,
                                                  "variants",
                                                  config_yaml)
 
-        # Filter sequences against reference proteome
+        # filter sequences against reference proteome
         if config_yaml["filter_seq_with_reference"]:
             log.info("Filter variant sequences with reference proteome...")
             if config_yaml["generate_subFASTA"] and config_yaml["reference_dataset"] != "":
@@ -1875,7 +1890,7 @@ if __name__ == "__main__":
             else:
                 fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
 
-            # Create temp folder
+            # create temp folder
             if not os.path.exists(os.path.join(output_path, "temp")):
                 os.mkdir(os.path.join(output_path, "temp"))
 
@@ -1895,7 +1910,7 @@ if __name__ == "__main__":
         else:
             fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
 
-        # Add disease information
+        # add disease information
         if config_yaml["add_disease_info"]:
             saav_list_data_processed_out = annotate_variant_info(saav_list_data_processed,
                                                                  "UniProtID",
@@ -1905,14 +1920,14 @@ if __name__ == "__main__":
                 os.path.join(output_path, "{}_disease_annotation_saav_list.tsv".format(timestamp_str)),
                 sep="\t")
 
-        # Map SAAVs to FASTA
+        # map SAAVs to FASTA
         saav_list_data_processed_list = convert_df_to_bio_list(saav_list_data_processed,
                                                                "uniprot_mut",
                                                                config_yaml["min_spec_pep_len"],
                                                                config_yaml["max_spec_pep_len"],
                                                                config_yaml["keep_saav_dups_in_fasta"])
 
-        # Write to FASTA
+        # write to FASTA
         log.info("Save annotated SAAV list as FASTA...")
         write_fasta(saav_list_data_processed_list, output_path, timestamp_str, "SAAV_sequences", "saav_list")
 
