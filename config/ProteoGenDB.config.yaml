@@ -1,4 +1,4 @@
-#v1.3
+#v1.4
 
 # General
 num_jobs: 16                                                                              # TSO500: 10, SAAVs: 24, COSMIC: 24
@@ -54,3 +54,7 @@ mfa_vaf_cutoff: 0.05                                                            
 # UniProt SAAVs
 map_uniprot: False                                                                        # if set to True, SAAVs from the provided UniProt database will be reported
 use_uniprot_reviewed: True                                                                # if set to True, only reviewed entries will be reported
+
+# map SAAV list
+map_saav_list: False                                                                      # if set to True, SAAVs from the provided SAAV list will be reported
+saav_list_path: ""                                                                        # path to SAAV list
