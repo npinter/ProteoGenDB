@@ -275,6 +275,11 @@ def read_tso(tso_path):
         tso_split = tso_input.read().split("[Small Variants]")[1][3:]
         tso_df = pd.read_csv(io.StringIO(tso_split), sep="\t")
 
+    # if only one entry with NA is present return empty dataframe with all columns
+    if tso_df["P-Dot Notation"].isna().all():
+        tso_df = pd.DataFrame(columns=["P-Dot Notation", "ProteinID", "VariantPos3", "VariantPos", "Sequence"])
+        return tso_df
+
     # extract NM ID
     tso_df["ProteinID"] = tso_df["P-Dot Notation"].str.extract(r"(NP_\d+\.\d+).*")
 
@@ -1371,109 +1376,113 @@ if __name__ == "__main__":
         log.info("Load CombinedVariantOutput of TSO 500 pipeline..")
         tso_data = read_tso(config_yaml["tso_path"])
 
-        # mutate
-        log.info("Mutate NCBI sequences with TSO mutations..")
-        tso_data_mut = multi_process("process_mutation",
-                                     tso_data,
-                                     "TSO mutations",
-                                     config_yaml)
+        # if no TSO data is present, skip the following steps
+        if tso_data.empty:
+            log.error("No variants in TSO data..")
+        else:
+            # mutate
+            log.info("Mutate NCBI sequences with TSO mutations..")
+            tso_data_mut = multi_process("process_mutation",
+                                         tso_data,
+                                         "TSO mutations",
+                                         config_yaml)
 
-        # process saavs
-        log.info("Process TSO mutations..")
-        tso_data_processed = multi_process("process_saavs",
-                                           tso_data_mut,
-                                           "variants",
-                                           config_yaml)
+            # process saavs
+            log.info("Process TSO mutations..")
+            tso_data_processed = multi_process("process_saavs",
+                                               tso_data_mut,
+                                               "variants",
+                                               config_yaml)
 
-        # get UniProt IDs via NCBI ID
-        log.info("Map UniProt IDs to ENSEMBL IDs..")
-        tso_prot_ids_unique = tso_data_processed[
-            ~tso_data_processed["ProteinID"].duplicated()
-        ]["ProteinID"].tolist()
+            # get UniProt IDs via NCBI ID
+            log.info("Map UniProt IDs to ENSEMBL IDs..")
+            tso_prot_ids_unique = tso_data_processed[
+                ~tso_data_processed["ProteinID"].duplicated()
+            ]["ProteinID"].tolist()
 
-        uniprot_lookup = get_uniprot_id(tso_prot_ids_unique,
-                                        fmt_from="RefSeq_Protein",
-                                        split_str=" ").rename({"FromID": "ProteinID",
-                                                              "ToID": "UniProtID"},
-                                                              axis=1)
-        uniprot_lookup["ProteinID"].apply(lambda x: x[:15])
+            uniprot_lookup = get_uniprot_id(tso_prot_ids_unique,
+                                            fmt_from="RefSeq_Protein",
+                                            split_str=" ").rename({"FromID": "ProteinID",
+                                                                  "ToID": "UniProtID"},
+                                                                  axis=1)
+            uniprot_lookup["ProteinID"].apply(lambda x: x[:15])
 
-        # map UniProt IDs with lookup table
-        tso_data_processed["UniProtID"] = multi_process("process_uniprot_ids",
-                                                        tso_data_processed["ProteinID"],
-                                                        "ids",
-                                                        uniprot_lookup)
+            # map UniProt IDs with lookup table
+            tso_data_processed["UniProtID"] = multi_process("process_uniprot_ids",
+                                                            tso_data_processed["ProteinID"],
+                                                            "ids",
+                                                            uniprot_lookup)
 
-        tso_data_processed["UniProtID"] = tso_data_processed["UniProtID"].replace("", "NoUniID")
+            tso_data_processed["UniProtID"] = tso_data_processed["UniProtID"].replace("", "NoUniID")
 
-        # keep proteins which are present in reference dataset if provided
-        if config_yaml["reference_dataset"] != "":
-            log.info("Filter UniProt IDs with reference dataset..")
-            tso_data_processed = filter_id_with_reference(tso_data_processed, config_yaml)
+            # keep proteins which are present in reference dataset if provided
+            if config_yaml["reference_dataset"] != "":
+                log.info("Filter UniProt IDs with reference dataset..")
+                tso_data_processed = filter_id_with_reference(tso_data_processed, config_yaml)
 
-        # filter sequences against reference proteome
-        if config_yaml["filter_seq_with_reference"]:
-            log.info("Filter variant sequences with reference proteome..")
-            if config_yaml["generate_subFASTA"] and config_yaml["reference_dataset"] != "":
-                log.info("Generate subFASTA proteome..")
-                fasta_proteome = subset_fasta_db(config_yaml["reference_proteome"],
-                                                 config_yaml["reference_dataset"])
+            # filter sequences against reference proteome
+            if config_yaml["filter_seq_with_reference"]:
+                log.info("Filter variant sequences with reference proteome..")
+                if config_yaml["generate_subFASTA"] and config_yaml["reference_dataset"] != "":
+                    log.info("Generate subFASTA proteome..")
+                    fasta_proteome = subset_fasta_db(config_yaml["reference_proteome"],
+                                                     config_yaml["reference_dataset"])
+                else:
+                    fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
+
+                # create temp folder
+                if not os.path.exists(os.path.join(output_path, "temp")):
+                    os.mkdir(os.path.join(output_path, "temp"))
+
+                tso_data_processed_h5 = multi_process("filter_seq_with_reference",
+                                                      tso_data_processed,
+                                                      "sequences",
+                                                      fasta_proteome,
+                                                      output_path)
+
+                tso_data_processed = pd.DataFrame()
+
+                for h5_path in tso_data_processed_h5:
+                    h5_path_key = os.path.splitext(os.path.basename(h5_path))[0]
+                    tso_data_processed_var_temp = pd.read_hdf(h5_path,
+                                                              h5_path_key)
+                    tso_data_processed = pd.concat([tso_data_processed, tso_data_processed_var_temp])
             else:
                 fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
 
-            # create temp folder
-            if not os.path.exists(os.path.join(output_path, "temp")):
-                os.mkdir(os.path.join(output_path, "temp"))
+            # add disease information
+            if config_yaml["add_disease_info"]:
+                tso_data_processed_out = annotate_variant_info(tso_data_processed,
+                                                               "Gene",
+                                                               config_yaml["annotation_data"],
+                                                               config_yaml["min_spec_pep_len"],
+                                                               config_yaml["max_spec_pep_len"]).to_csv(
+                    os.path.join(output_path, "{}_disease_annotation_tso.tsv".format(timestamp_str)),
+                    sep="\t")
 
-            tso_data_processed_h5 = multi_process("filter_seq_with_reference",
-                                                  tso_data_processed,
-                                                  "sequences",
-                                                  fasta_proteome,
-                                                  output_path)
+            # mapped SAAVS to FASTA
+            tso_data_processed_list = convert_df_to_bio_list(tso_data_processed,
+                                                             "tso",
+                                                             config_yaml["min_spec_pep_len"],
+                                                             config_yaml["max_spec_pep_len"],
+                                                             config_yaml["keep_saav_dups_in_fasta"])
 
-            tso_data_processed = pd.DataFrame()
+            # write to FASTA
+            log.info("Save annotated TSO SAAVs as FASTA..")
+            write_fasta(tso_data_processed_list, output_path, timestamp_str, "SAAV_sequences", "tso")
 
-            for h5_path in tso_data_processed_h5:
-                h5_path_key = os.path.splitext(os.path.basename(h5_path))[0]
-                tso_data_processed_var_temp = pd.read_hdf(h5_path,
-                                                          h5_path_key)
-                tso_data_processed = pd.concat([tso_data_processed, tso_data_processed_var_temp])
-        else:
-            fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
+            fasta_proteome_name = os.path.basename(config_yaml["reference_proteome"]).split(".")[0]
+            fasta_output = convert_df_to_bio_list(fasta_proteome, "uniprot")
+            fasta_combined_output = fasta_output + tso_data_processed_list
 
-        # add disease information
-        if config_yaml["add_disease_info"]:
-            tso_data_processed_out = annotate_variant_info(tso_data_processed,
-                                                           "Gene",
-                                                           config_yaml["annotation_data"],
-                                                           config_yaml["min_spec_pep_len"],
-                                                           config_yaml["max_spec_pep_len"]).to_csv(
-                os.path.join(output_path, "{}_disease_annotation_tso.tsv".format(timestamp_str)),
-                sep="\t")
+            if config_yaml["generate_subFASTA"]:
+                log.info("Save subFASTA proteome..")
 
-        # mapped SAAVS to FASTA
-        tso_data_processed_list = convert_df_to_bio_list(tso_data_processed,
-                                                         "tso",
-                                                         config_yaml["min_spec_pep_len"],
-                                                         config_yaml["max_spec_pep_len"],
-                                                         config_yaml["keep_saav_dups_in_fasta"])
-
-        # write to FASTA
-        log.info("Save annotated TSO SAAVs as FASTA..")
-        write_fasta(tso_data_processed_list, output_path, timestamp_str, "SAAV_sequences", "tso")
-
-        fasta_proteome_name = os.path.basename(config_yaml["reference_proteome"]).split(".")[0]
-        fasta_output = convert_df_to_bio_list(fasta_proteome, "uniprot")
-        fasta_combined_output = fasta_output + tso_data_processed_list
-
-        if config_yaml["generate_subFASTA"]:
-            log.info("Save subFASTA proteome..")
-
-            write_fasta(fasta_output, output_path, timestamp_str, "subFASTA", "tso")
-            write_fasta(fasta_combined_output, output_path, timestamp_str, "subFASTA_SAAV", "tso")
-        else:
-            log.info("Save FASTA proteome..")
-            write_fasta(fasta_combined_output, output_path, timestamp_str, "FASTA_SAAV", "tso")
+                write_fasta(fasta_output, output_path, timestamp_str, "subFASTA", "tso")
+                write_fasta(fasta_combined_output, output_path, timestamp_str, "subFASTA_SAAV", "tso")
+            else:
+                log.info("Save FASTA proteome..")
+                write_fasta(fasta_combined_output, output_path, timestamp_str, "FASTA_SAAV", "tso")
 
     if config_yaml["map_isoforms"]:
         # read related isoforms
