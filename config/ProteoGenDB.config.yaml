@@ -11,6 +11,7 @@ keep_saav_dups_in_fasta: False                                                  
 filter_seq_with_reference: True                                                           # filter SAAV sequences against the provided reference proteome
 filter_seq_with_reference_add_no_ids: False                                               # entries with no UniProt identifier will not be filtered out if set to True
 output_protein_seq: False                                                                 # add column with full protein sequence for mapped exon sequences
+ncbi_api_key: ""                                                                          # NCBI API key ("NM_" ids used for Strelka2 VCFs), 10 requests per second instead of 3, go to: https://account.ncbi.nlm.nih.gov/settings/
 
 # Disease info & variant filtering
 add_disease_info: True                                                                    # add disease information from EBI variants to FASTA header of variants
@@ -47,8 +48,8 @@ drop_unreviewed_isoforms: True                                                  
 drop_unmapped_isoforms: True                                                              # if set to True, isoforms without a corresponding consensus ID will be ignored
 
 # Read MFA
-map_mfa: False                                                                             # if set to True, SAAVs from the provided MFA file will be reported
-mfa_path: ""                                                                    # path to MFA file
+map_mfa: False                                                                            # if set to True, SAAVs from the provided MFA file will be reported
+mfa_path: ""                                                                              # path to MFA file
 mfa_vaf_cutoff: 0.05                                                                      # Variant allel freuquency cutoff. Default is 5% (0.05)
 
 # UniProt SAAVs
@@ -58,3 +59,10 @@ use_uniprot_reviewed: True                                                      
 # map SAAV list
 map_saav_list: False                                                                      # if set to True, SAAVs from the provided SAAV list will be reported
 saav_list_path: ""                                                                        # path to SAAV list
+
+# Get Strelka VCF SAAVs
+# Note: variants depend on the NM_ sequence rather than the consensus sequence
+# which may result in inconsistencies between the variant positions and the consensus
+# sequence of the reference proteome
+map_strelka_vcf: False                                                                    # if set to True, SAAVs from the provided Strelka VCF file will be reported
+strelka_vcf_path: ""                                                                      # path to Strelka VCF file

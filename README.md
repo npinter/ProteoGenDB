@@ -4,7 +4,7 @@
 
 ProteoGenDB is designed for generating custom peptide databases in the context of mass spectrometry-based proteomics. The primary aim of this tool is to identify and characterize protein variants, which remain a major challenge in modern proteomics. These variants often have important functional and clinical implications, providing insight into the genetic alterations driving cancer development and progression.
 
-Leveraging proteogenomics, transcriptomics, and other annotation data, ProteoGenDB creates a peptide-centric FASTA database of single amino acid variants (SAAVs) using input data from various sources. These sources include processed RNAseq data from a custom Galaxy workflow, variant information from the COSMIC database, the output from Illumina’s TruSight Oncology 500 gene panel, isoform fasta databases from UniProt, Mutation Annotation File (experimental), plain UniProt IDs or a defined list of SAAVs. By cross-referencing processed peptide variants with the UniProt database, the tool identifies variants previously reported to be associated with diseases or other clinically relevant conditions.
+Leveraging proteogenomics, transcriptomics, and other annotation data, ProteoGenDB creates a peptide-centric FASTA database of single amino acid variants (SAAVs) using input data from various sources. These sources include processed RNAseq data from a custom Galaxy workflow, variant information from the COSMIC database, the output from Illumina’s TruSight Oncology 500 gene panel, VCF outputs from Illumina's WES Strelka2 small variant caller, isoform fasta databases from UniProt, Mutation Annotation File (experimental), plain UniProt IDs or a defined list of SAAVs. By cross-referencing processed peptide variants with the UniProt database, the tool identifies variants previously reported to be associated with diseases or other clinically relevant conditions.
 
 ProteoGenDB offers users the option to filter peptide variants against a list of proteins identified in the dataset of interest, generating a subsetted reference proteome that can further filter peptide variants. This approach reduces the filter penalty of peptide variants, as the targeted proteome contains only identified proteins. Configuration of the tool is facilitated through a YAML file, which allows users to specify input datasets, filtering options, disease annotation, and output formats.
 ## Requirements
@@ -20,6 +20,7 @@ ProteoGenDB offers users the option to filter peptide variants against a list of
 - BeautifulSoup4 4.11.2
 - colorlog 6.7.0
 - tqdm 4.64.1
+- pyvcf 0.6.8
 
 ## Installation
 
@@ -33,7 +34,7 @@ cd ProteoGenDB
 2. Create a conda environment with the required packages:
 
 ```bash
-conda create -n ProteoGenDB -c conda-forge python=3.9 pandas=1.5.3 numpy=1.24.2 pytables=3.8.0 biopython=1.81 pyarrow=11.0.0 requests=2.25.1 PyYAML=6.0 beautifulsoup4=4.11.2 colorlog=6.7.0 tqdm=4.64.1
+conda create -n ProteoGenDB -c conda-forge python=3.9 pandas=1.5.3 numpy=1.24.2 pytables=3.8.0 biopython=1.81 pyarrow=11.0.0 requests=2.25.1 PyYAML=6.0 beautifulsoup4=4.11.2 colorlog=6.7.0 tqdm=4.64.1 pyvcf=0.6.8
 ```
 
 3. Activate the conda environment:

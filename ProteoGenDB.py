@@ -13,6 +13,7 @@ import requests
 import logging
 import json
 import platform
+import vcf
 from pyarrow import feather
 from requests.exceptions import ConnectionError
 from argparse import ArgumentParser
@@ -252,6 +253,69 @@ def read_fasta(fasta_file, database):
     return fasta_df_temp
 
 
+def read_strelka_vcf(vcf_path):
+    strelka_df = pd.DataFrame(columns=["ProteinID", "UniProtID", "VariantPos", "GeneID"])
+
+    if not isinstance(vcf_path, list):
+        vcf_path = [vcf_path]
+
+    for vcf_file in vcf_path:
+        vcf_reader = vcf.Reader(open(vcf_file, 'r'))
+
+        for record in vcf_reader:
+            info = record.INFO
+
+            # check if the variant is exonic and either nonsynonymous_SNV or stopgain
+            if 'ExonicFunc.refGeneWithVer' in info:
+                exonic_func = info['ExonicFunc.refGeneWithVer'][0]
+                if exonic_func not in ['nonsynonymous_SNV', 'stopgain', 'nonframeshift_deletion']:
+                    continue
+            else:
+                continue
+
+            # extract AAChange information
+            if 'AAChange.refGeneWithVer' in info:
+                aa_changes = info['AAChange.refGeneWithVer']
+                for aa_change in aa_changes:
+                    parts = aa_change.split(':')
+                    if len(parts) >= 5:
+                        gene_id, protein_id, _, _, aa_pos = parts[:5]
+                        protein_id = protein_id.split('.')[0]  # Remove version number
+                        aa_pos = aa_pos.split('.')[-1]  # Get only the amino acid change
+
+                        # replace X to * (stopgain)
+                        aa_pos = aa_pos.replace("X", "*")
+                        # replace del to - (deletion)
+                        aa_pos = aa_pos.replace("del", "-")
+
+                        strelka_df = pd.concat([strelka_df, pd.DataFrame({
+                            "ProteinID": protein_id,
+                            "VariantPos": [[aa_pos]],
+                            "GeneID": gene_id
+                        })], ignore_index=True)
+
+    # map RefSeq IDs to UniProt IDs
+    # not all RefSeq IDs can be mapped to UniProt IDs!
+    unique_protein_ids = strelka_df["ProteinID"].unique().tolist()
+
+    uniprot_mapping = get_uniprot_id(
+        unique_protein_ids,
+        fmt_from="RefSeq_Nucleotide",
+        split_str=" "
+    )
+
+    # create lookup dictionary
+    uniprot_dict = dict(zip(uniprot_mapping["FromID"], uniprot_mapping["ToID"]))
+
+    # add UniProt IDs to the dataframe
+    strelka_df["UniProtID"] = strelka_df["ProteinID"].map(uniprot_dict)
+
+    # fill NaN values with "NoUniID"
+    strelka_df["UniProtID"] = strelka_df["UniProtID"].fillna("NoUniID")
+
+    return strelka_df
+
+
 def subset_fasta_db(fasta_db, exp_mat):
     fasta_df_temp = read_fasta(fasta_db, "uniprot")
 
@@ -403,19 +467,53 @@ def get_uniprot_id(ids, fmt_from="Ensembl_Protein", fmt_to="UniProtKB", ens_sub=
     return result_df
 
 
-def fetch_fasta(pids, df_status, jid, p_bar_val, mode, *_):
+def fetch_fasta(pids, df_status, jid, p_bar_val, *args):
     base_url = None
     prot_seq_rec = None
     seq_records = []
+    mode = args[0][0]
 
-    if mode[0] == "ncbi":
+    if mode == "ncbi":
         for i_pid, pid in enumerate(pids):
             # ToDo: check if temp database entry exists if not get from NCBI and write to disk
             base_url = "https://www.ncbi.nlm.nih.gov/search/api/download-sequence/?db=protein&id={pid}&filename={pid}"
             prot_seq_rec = SeqIO.read(io.StringIO(requests.get(base_url.format(pid=pid)).text), "fasta").seq
             seq_records.append(prot_seq_rec)
             p_bar_val[jid] = i_pid
-    elif mode[0] == "uniprot":
+    elif mode == "ncbi_NM":
+        ncbi_api_key = args[0][1]
+        efetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+        for i_pid, pid in enumerate(pids):
+            ncbi_api_status = True
+            while ncbi_api_status:
+                try:
+                    params = {
+                        "db": "nucleotide",
+                        "id": pid,
+                        "rettype": "fasta_cds_aa",
+                        "retmode": "xml",
+                        "api_key": ncbi_api_key
+                    }
+                    response = requests.get(efetch_url, params=params)
+
+                    # extract the translated sequence
+                    translated_seq = ''.join(response.text.split("\n")[1:])
+                    prot_seq_rec = Seq(translated_seq)
+                    seq_records.append(prot_seq_rec)
+                    # when response 429 (rate limit), 500 (server error), .. log error
+                    if response.status_code != 200:
+                        log.error(f"{pid}: Error fetching sequences from NCBI! - retry..")
+                    else:
+                        ncbi_api_status = False
+                    # small delay when no API key to avoid rate limiting
+                    if ncbi_api_key == "":
+                        sleep(5)
+                    else:
+                        sleep(2)
+                except Exception as e:
+                    log.error(f"Error fetching sequence for {pid}: {str(e)}")
+            p_bar_val[jid] = i_pid
+    elif mode == "uniprot":
         pid_list = [pids[i:i + 100] for i in range(0, len(pids), 100)]
         pid_num = 0
 
@@ -958,7 +1056,7 @@ def convert_df_to_bio_list(pd_seq, seq_format, min_pep_len=None, max_pep_len=Non
     seq_dups = []
     var_header = None
 
-    if seq_format in ["galaxy", "cosmic", "tso", "isoform", "mfa", "uniprot_mut", "saav_list"]:
+    if seq_format in ["galaxy", "cosmic", "tso", "strelka", "isoform", "mfa", "uniprot_mut", "saav_list"]:
         for i_var_pep, var_pep in pd_seq.VarSeqCleave.items():
             var_counter = 1
             var_seq_last = None
@@ -988,7 +1086,7 @@ def convert_df_to_bio_list(pd_seq, seq_format, min_pep_len=None, max_pep_len=Non
                             var_pos,
                             var_counter,
                             "{}".format(pd_seq.CosmicID.loc[i_var_pep]))
-                    elif seq_format == "tso":
+                    elif seq_format in ["tso", "strelka"]:
                         # FASTA header: sp|UniProtID_VariantPos|RefSeq_Protein
                         var_header = "sp|{}_{}_{}|{}".format(
                             pd_seq.UniProtID.loc[i_var_pep],
@@ -1951,6 +2049,108 @@ if __name__ == "__main__":
         else:
             log.info("Save FASTA proteome...")
             write_fasta(fasta_combined_output, output_path, timestamp_str, "FASTA_SAAV", "saav_list")
+
+    if config_yaml["map_strelka_vcf"]:
+        log.info("Processing Strelka VCF file...")
+        strelka_data = read_strelka_vcf(config_yaml["strelka_vcf_path"])
+
+        # fetch protein sequences
+        log.info("Fetching protein sequences for Strelka variants...")
+        strelka_data_uniprot_ids = strelka_data["ProteinID"].drop_duplicates().tolist()
+        strelka_data_sequences = multi_process("fetch_fasta",
+                                               strelka_data_uniprot_ids,
+                                               "ids",
+                                               "ncbi_NM",
+                                               config_yaml["ncbi_api_key"])
+
+        # merge sequences with variant data
+        strelka_data_sequences_df = pd.DataFrame(
+            list(zip(strelka_data_uniprot_ids, strelka_data_sequences)),
+            columns=["ProteinID", "Sequence"]
+        )
+        strelka_data = strelka_data.merge(strelka_data_sequences_df, on="ProteinID", how="left")
+
+        # mutate sequences
+        log.info("Generating mutated sequences...")
+        strelka_data_mut = multi_process("process_mutation",
+                                         strelka_data,
+                                         "mutations",
+                                         config_yaml)
+
+        # process SAAVs
+        log.info("Processing Strelka mutations...")
+        strelka_data_processed = multi_process("process_saavs",
+                                               strelka_data_mut,
+                                               "variants",
+                                               config_yaml)
+
+        # keep proteins which are present in reference dataset if provided
+        if config_yaml["reference_dataset"] != "":
+            log.info("Filter UniProt IDs with reference dataset..")
+            strelka_data_processed = filter_id_with_reference(strelka_data_processed, config_yaml)
+
+        # filter sequences against reference proteome (if enabled)
+        if config_yaml["filter_seq_with_reference"]:
+            log.info("Filter variant sequences with reference proteome...")
+            if config_yaml["generate_subFASTA"] and config_yaml["reference_dataset"] != "":
+                log.info("Generate subFASTA proteome...")
+                fasta_proteome = subset_fasta_db(config_yaml["reference_proteome"],
+                                                 config_yaml["reference_dataset"])
+            else:
+                fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
+
+            # create temp folder
+            if not os.path.exists(os.path.join(output_path, "temp")):
+                os.mkdir(os.path.join(output_path, "temp"))
+
+            strelka_data_processed_h5 = multi_process("filter_seq_with_reference",
+                                                      strelka_data_processed,
+                                                      "sequences",
+                                                      fasta_proteome,
+                                                      output_path)
+
+            strelka_data_processed = pd.DataFrame()
+
+            for h5_path in strelka_data_processed_h5:
+                h5_path_key = os.path.splitext(os.path.basename(h5_path))[0]
+                strelka_data_processed_var_temp = pd.read_hdf(h5_path,
+                                                              h5_path_key)
+                strelka_data_processed = pd.concat([strelka_data_processed, strelka_data_processed_var_temp])
+        else:
+            fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
+
+        # add disease information (if enabled)
+        if config_yaml["add_disease_info"]:
+            strelka_data_processed_out = annotate_variant_info(strelka_data_processed,
+                                                              "ProteinID",
+                                                              config_yaml["annotation_data"],
+                                                              config_yaml["min_spec_pep_len"],
+                                                              config_yaml["max_spec_pep_len"]).to_csv(
+                os.path.join(output_path, "{}_disease_annotation_strelka.tsv".format(timestamp_str)),
+                sep="\t")
+
+        # map SAAVs to FASTA
+        strelka_data_processed_list = convert_df_to_bio_list(strelka_data_processed,
+                                                             "strelka",
+                                                             config_yaml["min_spec_pep_len"],
+                                                             config_yaml["max_spec_pep_len"],
+                                                             config_yaml["keep_saav_dups_in_fasta"])
+
+        # write to FASTA
+        log.info("Save annotated Strelka SAAVs as FASTA...")
+        write_fasta(strelka_data_processed_list, output_path, timestamp_str, "SAAV_sequences", "strelka")
+
+        fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
+        fasta_output = convert_df_to_bio_list(fasta_proteome, "uniprot")
+        fasta_combined_output = fasta_output + strelka_data_processed_list
+
+        if config_yaml["generate_subFASTA"]:
+            log.info("Save subFASTA proteome...")
+            write_fasta(fasta_output, output_path, timestamp_str, "subFASTA", "strelka")
+            write_fasta(fasta_combined_output, output_path, timestamp_str, "subFASTA_SAAV", "strelka")
+        else:
+            log.info("Save FASTA proteome...")
+            write_fasta(fasta_combined_output, output_path, timestamp_str, "FASTA_SAAV", "strelka")
 
 
     end_time = time.time()
