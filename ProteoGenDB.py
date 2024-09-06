@@ -709,7 +709,8 @@ def map_variant_info(dl_df, df_status, jid, p_bar_val, *args):
     min_pep_len = args[0][1]
     max_pep_len = args[0][2]
 
-    input_df_temp = pd.DataFrame()
+    columns = input_df.columns.union(dl_df.columns)
+    input_df_temp = pd.DataFrame(columns=columns)
 
     for index, var in dl_df.iterrows():
         prot_temp_df = input_df.loc[
