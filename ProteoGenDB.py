@@ -2,7 +2,6 @@ import os
 import io
 import re
 import shutil
-import sys
 import time
 import yaml
 import warnings
@@ -15,6 +14,8 @@ import json
 import platform
 import vcf
 from pyarrow import feather
+from dataclasses import dataclass
+from typing import Callable, Optional, Tuple, Union, List, cast
 from requests.exceptions import ConnectionError
 from argparse import ArgumentParser
 from datetime import datetime
@@ -25,17 +26,15 @@ from Bio.SeqRecord import SeqRecord
 from time import sleep
 from tqdm import tqdm
 
-
 global start_time
 
-LOG_LEVEL = logging.DEBUG
-LOGFORMAT = "%(log_color)s%(asctime)s %(message)s%(reset)s"
-LOGFORMAT_WEL = "%(log_color)s%(message)s%(reset)s"
+LOG_LEVEL   = logging.DEBUG
+LOGFORMAT   = "%(log_color)s%(asctime)s %(message)s%(reset)s"
+LOGFORMAT_W = "%(log_color)s%(message)s%(reset)s"
 
 stream = logging.StreamHandler()
 stream.setLevel(LOG_LEVEL)
-stream.setFormatter(ColoredFormatter(LOGFORMAT_WEL))
-
+stream.setFormatter(ColoredFormatter(LOGFORMAT_W))
 log = logging
 log.getLogger().setLevel(logging.INFO)
 log.getLogger("requests").setLevel(logging.WARNING)
@@ -58,10 +57,16 @@ def print_welcome():
  |_|   |_|  \___/ \__\___|\___/ \_____|\___|_| |_|_____/|____/                              
 """)
     log.info(" Niko Pinter - https://github.com/npinter/ProteoGenDB")
-    log.info(" v1.5 \n")
+    log.info(" v2.0.0 \n")
 
 
 def multi_process(func, input_df, unit, *args):
+    # fail-safe for empty input_df
+    if len(input_df) == 0:
+        return (pd.DataFrame(columns=input_df.columns)
+                if isinstance(input_df, pd.DataFrame)
+                else pd.Series(dtype=object))
+
     with multiprocessing.Manager() as manager:
         df_status = manager.dict()
         progress_bar_value = manager.dict()
@@ -283,6 +288,9 @@ def read_strelka_vcf(vcf_path):
                         protein_id = protein_id.split('.')[0]  # Remove version number
                         aa_pos = aa_pos.split('.')[-1]  # Get only the amino acid change
 
+                        if "delins" in aa_pos or "_" in aa_pos or "fs" in aa_pos:
+                            continue
+
                         # replace X to * (stopgain)
                         aa_pos = aa_pos.replace("X", "*")
                         # replace del to - (deletion)
@@ -468,8 +476,6 @@ def get_uniprot_id(ids, fmt_from="Ensembl_Protein", fmt_to="UniProtKB", ens_sub=
 
 
 def fetch_fasta(pids, df_status, jid, p_bar_val, *args):
-    base_url = None
-    prot_seq_rec = None
     seq_records = []
     mode = args[0][0]
 
@@ -549,7 +555,7 @@ def get_annotation_data(pids, df_status, jid, p_bar_val, *args):
     api_url = args[0][1]
     annot_folder = args[0][2]
 
-    api_annot_path = os.path.join(annot_folder)
+    api_annot_path = str(os.path.join(annot_folder))
 
     # load Feather storage
     feather_filename = "{}_data.feather".format(api_name)
@@ -567,6 +573,7 @@ def get_annotation_data(pids, df_status, jid, p_bar_val, *args):
     data_new = pd.DataFrame(columns=["pid", "data"])
     result_data = []
     feather_save = False
+    api_data = None
 
     # get pid data from Feather or update it via API
     for i_pid, pid in enumerate(pids):
@@ -840,29 +847,6 @@ def process_uniprot_ids(ids, df_status, jid, p_bar_val, *args):
     df_status[jid] = out_df["UniProtID"]
 
 
-def annotate_saavs(fasta_df, cfg):
-    log.info("Annotate SAAVs from Galaxy Workflow..")
-
-    # extract SAAVs position from ProteinID
-    fasta_df_temp = fasta_df
-    fasta_df_temp["VariantPos"] = fasta_df["ProteinID"].str.split(pat="_").str[-1]
-
-    # logic if ProteinID == VariantPos --> isoform/None
-    fasta_df_temp.loc[(fasta_df_temp.VariantPos == fasta_df_temp.ProteinID), 'VariantPos'] = None
-
-    # split iso and saavs
-    fasta_df_var = fasta_df_temp[fasta_df_temp.VariantPos.notnull()]
-    # fasta_df_iso = fasta_df_temp[fasta_df_temp.VariantPos.isnull()]
-
-    # multiple SAAVs to list
-    fasta_df_var["VariantPos"] = fasta_df_var["VariantPos"].str.split(pat=".")
-
-    # generate variant sequences
-    fasta_df_var = multi_process("process_saavs", fasta_df_var, "variants", cfg)
-
-    return fasta_df_var
-
-
 def process_saavs(df, df_status, jid, p_bar_val, *args):
     cfg = args[0][0]
 
@@ -963,7 +947,7 @@ def process_mutation(df, df_status, jid, p_bar_val, *args):
 
 
 def cleave_sequence(var_dict, cfg, full_protein=False):
-    regex = re.compile(cfg["enzyme_specificity"])
+    regex = re.compile(cfg["enzyme_specificity"], re.IGNORECASE)
 
     enz_spec = [(str(var_dict).index(enz_match) + 1, str(var_dict).index(enz_match) + len(enz_match), enz_match)
                 for enz_match in regex.findall(str(var_dict))]
@@ -1035,7 +1019,7 @@ def filter_seq_with_reference(input_df, df_status, jid, p_bar_val, *args):
 
     i_var_pep = 0
     for var_pep in input_df.itertuples():
-        temp_var_seq_str = str(next(iter(var_pep.VarSeqCleave[0].values())))
+        temp_var_seq_str = str(next(iter(var_pep.VarSeqCleave[0].values()))).upper()
         ref_contains_bool = ref_df.eq(temp_var_seq_str).any()
         temp_bool_list.append(ref_contains_bool)
 
@@ -1053,6 +1037,10 @@ def filter_seq_with_reference(input_df, df_status, jid, p_bar_val, *args):
 
 
 def convert_df_to_bio_list(pd_seq, seq_format, min_pep_len=None, max_pep_len=None, keep_dups=None):
+    # fail-safe checks
+    if pd_seq.empty:
+        return []
+
     seq_records = []
     seq_dups = []
     var_header = None
@@ -1081,9 +1069,10 @@ def convert_df_to_bio_list(pd_seq, seq_format, min_pep_len=None, max_pep_len=Non
                             var_counter,
                             pd_seq.ProteinID.loc[i_var_pep].split("_")[0])
                     elif seq_format == "cosmic":
-                        # FASTA header: sp|UniProtID_VariantPos|COSMICID
-                        var_header = "sp|{}_{}_{}|{}".format(
+                        # FASTA header: sp|UniProtID_ProteinID_VariantPos|COSMICID
+                        var_header = "sp|{}_{}_{}_{}|{}".format(
                             pd_seq.UniProtID.loc[i_var_pep],
+                            pd_seq.ProteinID.loc[i_var_pep],
                             var_pos,
                             var_counter,
                             "{}".format(pd_seq.CosmicID.loc[i_var_pep]))
@@ -1153,1009 +1142,531 @@ def read_saav_list(saav_list_path):
     return saav_df
 
 
-if __name__ == "__main__":
+def read_enst_list(enst_path):
+    df = pd.read_csv(enst_path, sep=None, engine="python")
+    df = df.rename(columns={df.columns[0]: "TranscriptID",
+                            df.columns[1]: "VariantPos"})
+    df["VariantPos"] = df["VariantPos"].str.strip().apply(lambda x: [x])
+    return df
+
+
+def prepare_reference_proteome(cfg):
+    if cfg.get("_proteome_cache") is not None:
+        return cfg["_proteome_cache"]
+
+    if cfg["generate_subFASTA"] and cfg["reference_dataset"]:
+        log.info("Generate subFASTA proteome..")
+        prot = subset_fasta_db(cfg["reference_proteome"],
+                               cfg["reference_dataset"])
+    else:
+        prot = read_fasta(cfg["reference_proteome"], "uniprot")
+
+    cfg["_proteome_cache"] = prot
+    return prot
+
+
+def filter_to_consensus(df, proteome, seq_col="Sequence", id_col="UniProtID"):
+    # get reference sequences from proteome
+    ref = (
+        proteome
+        .dropna(subset=["Sequence", "Identifier"])
+        .drop_duplicates(subset=["Identifier"])
+        .set_index("Identifier")["Sequence"]
+        .to_dict()
+    )
+
+    keep_mask: List[bool] = []
+
+    # drop duplicated sequences in df with combined id_col and VariantPos identifier
+    df = df.drop_duplicates(subset=[id_col, seq_col], keep="first")
+
+    for uni_id, nm_seq in zip(df[id_col], df[seq_col]):
+        nm_str = str(nm_seq).upper() if pd.notna(nm_seq) else ""
+        # Note: NoUniID will be filtered out here!
+        ref_str = str(ref.get(uni_id, ""))
+
+        # NM sequence identical to reference sequence -> keep
+        if nm_str == ref_str:
+            keep_mask.append(True)
+            continue
+
+        # NM sequence is part of the reference sequence -> drop (aka isoform)
+        if nm_str in ref_str:
+            keep_mask.append(False)
+            continue
+
+        keep_mask.append(False)
+
+    return df.loc[keep_mask].reset_index(drop=True)
+
+
+def mark_mutated_residues(df, seq_col="Sequence", var_col="VariantPos"):
+    for i, row in df.iterrows():
+        seq: Union[str, Seq, None] = row[seq_col]
+        if not seq or pd.isna(seq):
+            continue
+        seq_str = str(seq)
+
+        for var in row[var_col]:
+            # only simple substitutions get a lower-case mark
+            if var[-1].isalpha(): # skip "*" or "-"
+                pos = int(var[1:-1]) - 1
+                if pos >= len(seq_str):
+                    continue
+                # reference AA matches sequence
+                if seq_str[pos].upper() == var[-1]:
+                    seq_str = (
+                        seq_str[:pos]
+                        + seq_str[pos].lower()
+                        + seq_str[pos + 1 :])
+        # store back as the same type that came in
+        df.at[i, seq_col] = Seq(seq_str) if isinstance(seq, Seq) else seq_str
+    return df
+
+
+def load_galaxy(cfg: dict) -> Tuple[pd.DataFrame, str, str, None, str]:
+    df = read_fasta(cfg["fasta_proteogen_path"], "galaxy")
+
+    log.info("Annotate SAAVs from Galaxy Workflow..")
+    # extract SAAVs position from ProteinID
+    df_temp = df.copy()
+    df_temp["VariantPos"] = df["ProteinID"].str.split(pat="_").str[-1]
+
+    # logic if ProteinID == VariantPos --> isoform/None
+    df_temp.loc[(df_temp.VariantPos == df_temp.ProteinID), 'VariantPos'] = None
+
+    # split iso and saavs
+    df_var = df_temp[df_temp.VariantPos.notnull()]
+    # df_iso = df_temp[df_temp.VariantPos.isnull()]
+
+    # multiple SAAVs to list
+    df_var["VariantPos"] = df_var["VariantPos"].str.split(pat=".")
+
+    return df_var, "GeneID", "galaxy", None, "variants"
+
+
+def load_cosmic(cfg: dict) -> Tuple[pd.DataFrame, str, str, str, str]:
+    log.info("Load ENSEMBL reference FASTA..")
+    ensembl_seqs = read_fasta(cfg["fasta_ensembl"], "ensembl")[["ProteinID", "Sequence"]]
+
+    log.info("Load CosmicMutantExport.tsv..")
+    cosmic_cols = {
+        "Accession Number":    "str",
+        "LEGACY_MUTATION_ID":  "str",
+        "Mutation AA":         "str",
+        "HGVSP":               "str",
+        "Primary site":        "str"
+    }
+    cosmic = pd.read_table(
+        cfg["cosmic_mutant_export"],
+        usecols=list(cosmic_cols),
+        encoding="cp1252"
+    )
+
+    if cfg.get("cosmic_primary_site_filter", False):
+        desired_site = cfg.get("cosmic_primary_site_set")
+        if desired_site:
+            cosmic = cosmic[cosmic["Primary site"] == desired_site]
+        else:
+            log.warning("cosmic_primary_site_filter is True "
+                        "but 'cosmic_primary_site_set' not given – "
+                        "keeping all sites.")
+
+    cosmic = cosmic[cosmic["HGVSP"].notnull()].filter(["LEGACY_MUTATION_ID",
+                                                       "Mutation AA",
+                                                       "HGVSP"])
+
+    cosmic["ProteinID"]  = cosmic["HGVSP"].str.split(":").str[0]  # ENSP
+    cosmic["VariantPos"] = cosmic["Mutation AA"].str.replace(r"^p\.", "", regex=True)
+
+    # drop all coding silent substitutions, deletions, insertions, duplications, frameshifts
+    cosmic = cosmic[
+        ~cosmic["VariantPos"].str.contains(r"=|del|ins|dup|fs|ext|Sec|\?", case=False, na=False)
+    ]
+
+    cosmic = cosmic.rename(columns={"LEGACY_MUTATION_ID": "CosmicID"})
+    cosmic = cosmic[["CosmicID", "ProteinID", "VariantPos"]].drop_duplicates()
+    cosmic["VariantPos"] = cosmic["VariantPos"].apply(lambda x: [x])
+
+    # add ENSEMBL sequences
+    cosmic = cosmic.merge(ensembl_seqs, on="ProteinID", how="left")
+
+    # list for UniProt mapping
+    prot_ids = cosmic["ProteinID"].drop_duplicates().tolist()
+
+    # first, try the full ID incl. sub-version
+    lookup_full = get_uniprot_id(prot_ids).rename(
+        columns={"FromID": "ProteinID", "ToID": "UniProtID"}
+    )
+
+    # re-try the still-unmapped IDs after stripping the ".x" suffix
+    unresolved      = [p for p in prot_ids if p not in lookup_full["ProteinID"].values]
+    unresolved_base = [p.split(".", 1)[0] for p in unresolved]
+
+    lookup_base = pd.DataFrame()
+    if unresolved_base:
+        lookup_base = get_uniprot_id(unresolved_base).rename(
+            columns={"FromID": "ProteinID", "ToID": "UniProtID"}
+        )
+
+    # combined lookup table
+    uniprot_lookup = pd.concat([lookup_full, lookup_base], ignore_index=True)
+
+    # broadcast UniProtIDs to every row
+    cosmic["UniProtID"] = multi_process(
+        "process_uniprot_ids",
+        cosmic["ProteinID"].tolist(),
+        "ids",
+        uniprot_lookup
+    )
+    cosmic["UniProtID"] = cosmic["UniProtID"].replace("", "NoUniID")
+
+    # ready for the central pipeline
+    return cosmic, "CosmicID", "cosmic", "COSMIC mutations", "COSMIC variants"
+
+
+def load_tso(cfg: dict) -> Tuple[pd.DataFrame, str, str, str, str]:
+    df = read_tso(cfg["tso_path"])
+    if df.empty:
+        log.error("No variants in TSO data..")
+        return pd.DataFrame(), "", "", "", ""
+
+    # get UniProt IDs via NCBI ID
+    log.info("Map UniProt IDs to ENSEMBL IDs..")
+    uniprot = get_uniprot_id(df["ProteinID"].drop_duplicates().tolist(),
+                             fmt_from="RefSeq_Protein",
+                             split_str=" ").rename(columns={"FromID": "ProteinID",
+                                                             "ToID": "UniProtID"})
+
+    uniprot["ProteinID"].apply(lambda x: x[:15])
+
+    # map UniProt IDs with lookup table
+    df["UniProtID"] = multi_process("process_uniprot_ids",
+                                    df["ProteinID"],
+                                    "ids",
+                                    uniprot)
+
+    df["UniProtID"] = df["UniProtID"].fillna("NoUniID")
+
+    return df, "Gene", "tso", "TSO mutation", "variants"
+
+
+def load_mfa(cfg: dict) -> Tuple[pd.DataFrame, str, str, str, str]:
+    mfa = pd.read_table(cfg["mfa_path"])
+
+    # columns to keep: gene_name, Variant_Classification, tx, aaChange, ExonicFunc.refGene, TumorVAF
+    mfa = mfa[
+        ["gene_name", "Variant_Classification", "tx", "txChange", "aaChange", "ExonicFunc.refGene", "TumorVAF"]]
+
+    # drop rows without aaChange
+    mfa = mfa[mfa["aaChange"].str.startswith("p.", na=False)]
+
+    # keep nonsynonymous SNV
+    mfa = mfa[mfa["ExonicFunc.refGene"].isin(["nonsynonymous SNV", "stopgain"])]
+
+    # drop rows where txChange contains an "_"
+    mfa = mfa[~mfa["txChange"].str.contains("_")]
+
+    # change X to * in aaChange
+    mfa["aaChange"] = mfa["aaChange"].str.replace("X", "*")
+
+    # filter for VAF (according to config.yaml value)
+    mfa = mfa[mfa["TumorVAF"] >= cfg["mfa_vaf_cutoff"]]
+
+    # strip p. from aaChange
+    mfa["VariantPos"] = mfa["aaChange"].str.replace("p.", "", regex=False)
+
+    # put VariantPos in list
+    mfa["VariantPos"] = mfa["VariantPos"].apply(lambda x: [x])
+
+    # map gene to uniprot, fetch sequences, mutate, digest
+    uniprot = get_uniprot_id(mfa["gene_name"].unique(), fmt_from="Ensembl")\
+              .rename(columns={"FromID": "gene_name", "ToID": "UniProtID"})
+
+    log.info("Fetching UniProt sequences for mfa variants..")
+    uniprot["Sequence"] = multi_process("fetch_fasta",
+                                        uniprot["UniProtID"].tolist(),
+                                        "ids",
+                                        "uniprot")
+
+    mfa = mfa.merge(uniprot, on="gene_name", how="left").dropna(subset=["Sequence"])
+
+    # rename gene_name to GeneID
+    mfa = mfa.rename(columns={"gene_name": "GeneID"})
+
+    # drop NAs in GeneID
+    mfa = mfa.dropna(subset=["GeneID"])
+
+    return mfa, "Gene", "mfa", "mfa mutation", "variants"
+
+
+def load_strelka(cfg: dict) -> Tuple[pd.DataFrame, str, str, str, str]:
+    df = read_strelka_vcf(cfg["strelka_vcf_path"])
+    if df.empty:
+        return df, "", "", "", ""
+
+    # fetch protein sequences
+    log.info("Fetching protein sequences for Strelka variants..")
+    df_uniprot_ids = df["ProteinID"].drop_duplicates().tolist()
+    df_sequences = multi_process("fetch_fasta",
+                                  df_uniprot_ids,
+                                  "ids",
+                                  "ncbi_NM",
+                                  cfg["ncbi_api_key"])
+
+    # merge sequences with variant data
+    df_sequences_df = pd.DataFrame(
+        list(zip(df_uniprot_ids, df_sequences)),
+        columns=["ProteinID", "Sequence"]
+    )
+    df = df.merge(df_sequences_df, on="ProteinID", how="left")
+
+    if cfg["strelka_mutation_filter"]:
+        # filter out WT sequences of that are not in the reference proteome
+        log.info("Filter Strelka variants with reference proteome..")
+        # drop sequences that could not be matched with a consensus sequence
+        df = filter_to_consensus(df, prepare_reference_proteome(cfg), seq_col="Sequence", id_col="UniProtID")
+
+    return df, "ProteinID", "strelka", "WES mut", "variants"
+
+
+def load_saav_list(cfg: dict) -> Tuple[pd.DataFrame, str, str, str, str]:
+    df = read_saav_list(cfg["saav_list_path"])
+
+    log.info("Fetching protein sequences for SAAVs..")
+    df["Sequence"] = multi_process("fetch_fasta",
+                                   df["UniProtID"].drop_duplicates().tolist(),
+                                   "ids",
+                                   "uniprot")
+
+    return df, "UniProtID", "uniprot_mut", "SAAVs", "variants"
+
+
+def load_uniprot(cfg: dict) -> Tuple[pd.DataFrame, str, str, str, str]:
+    ref_ids = pd.read_table(cfg["reference_dataset"]).iloc[:, 0].drop_duplicates()
+
+    log.info("Get mutations from UniProt..")
+    anns = multi_process("get_annotation_data",
+                         ref_ids,
+                         "UniProtID",
+                         "ebi",
+                         "https://www.ebi.ac.uk/proteins/api/variation/{pid}",
+                         cfg["annotation_data"])
+
+    log.info("Process UniProt mutations data..")
+    anns = multi_process("get_variant_info",
+                         anns,
+                         "uni",
+                         cfg)
+
+    proteome = read_fasta(cfg["reference_proteome"], "uniprot")[["Identifier","Sequence"]]
+    anns = anns.merge(proteome,
+                      left_on="DL_UniProtID",
+                      right_on="Identifier",
+                      how="left").rename(columns={"DL_UniProtID":"UniProtID",
+                                                  "DL_VariantPos":"VariantPos",
+                                                  "DL_ftID":"VariantID"}).drop(columns="Identifier")
+    anns = anns[["UniProtID","VariantPos","VariantID","Sequence"]]
+
+    # drop empty list in VariantPos
+    anns = anns[anns["VariantPos"].str.len() > 0]
+
+    # drop entries with A123None or None123A in VariantPos (fix for None values)
+    anns = anns[~anns["VariantPos"].apply(lambda x: any(
+        [v.startswith("None") or v.endswith("None") for v in x]
+    ))]
+
+    # drop entries with A16AA or EP16A in VariantPos (multiple like APG188E or E188APG as well)
+    anns = anns[~anns["VariantPos"].apply(lambda x: any(
+        [re.match(r"^[A-Z]{2,4}\d+[A-Z]{1,4}$", v) or re.match(r"^[A-Z]{1,4}\d+[A-Z]{2,4}$", v) for v in x]
+    ))]
+
+    return anns, "GeneID", "uniprot_mut", "UniProt mutations", "variants"
+
+
+def load_enst(cfg: dict) -> Tuple[pd.DataFrame, str, str, str, str]:
+    df = read_enst_list(cfg["enst_path"])
+
+    # map to UniProt
+    log.info("Mapping ENST transcript IDs to UniProt IDs..")
+    uniprot = get_uniprot_id(df["TranscriptID"].drop_duplicates().tolist(),
+                             fmt_from="Ensembl_Transcript")\
+              .rename(columns={"FromID": "TranscriptID",
+                               "ToID":   "UniProtID"})
+    df = df.merge(uniprot, on="TranscriptID", how="left")
+    df["UniProtID"] = df["UniProtID"].fillna("NoUniID")
+
+    # fetch sequences
+    log.info("Fetching UniProt sequences..")
+    ids  = df.loc[df.UniProtID != "NoUniID", "UniProtID"].drop_duplicates().tolist()
+    seqs = multi_process("fetch_fasta",
+                         ids,
+                         "ids",
+                         "uniprot")
+    df   = df.merge(pd.DataFrame(list(zip(ids, seqs)),
+                                 columns=["UniProtID", "Sequence"]),
+                    on="UniProtID", how="left")
+
+    return df, "UniProtID", "uniprot_mut", "ENST mutations", "variants"
+
+
+@dataclass
+class SourceSpec:
+    cfg_flag: str
+    loader:   Callable[[dict], Tuple[pd.DataFrame, str, str, Optional[str], str]]
+    fasta_tag: str
+
+
+def run_source_pipeline(src_df: pd.DataFrame,
+                        join_key: str,
+                        seq_fmt: str,
+                        fasta_tag: str,
+                        cfg: dict,
+                        out_dir: str,
+                        ts: str,
+                        proc_mut_unit: str,
+                        proc_saavs_unit: str) -> None:
+
+    if src_df.empty:
+        log.warning(f"{fasta_tag}: no data – skipped.")
+        return
+
+    # keep only proteins present in reference dataset (if requested)
+    if cfg["reference_dataset"]:
+        log.info("Filter UniProtIDs with reference dataset..")
+        src_df = filter_id_with_reference(src_df, cfg)
+
+    # if no reference list yet user does *not* want orphan IDs, drop them
+    elif not cfg.get("filter_seq_with_reference_add_no_ids", True):
+        log.warning(
+            "No reference dataset provided, but "
+            "'filter_seq_with_reference_add_no_ids' is False – dropping NoUniID rows.")
+        if "UniProtID" in src_df.columns:
+            src_df = src_df[src_df["UniProtID"] != "NoUniID"]
+
+    # mutate sequences
+    if proc_mut_unit:
+        log.info("Generating mutated sequences..")
+        src_df = multi_process("process_mutation",
+                               src_df,
+                               proc_mut_unit,
+                               cfg)
+
+    # mark mutated residues in SAAV sequences
+    log.info("Mark mutated residues in sequences..")
+    src_df = mark_mutated_residues(src_df)
+
+    # process SAAVs
+    log.info("Processing mutations..")
+    src_df = multi_process("process_saavs",
+                           src_df,
+                           proc_saavs_unit,
+                           cfg)
+
+    # filter against the reference proteome
+    proteome_available = bool(cfg.get("reference_proteome"))
+    proteome           = pd.DataFrame()
+
+    # filter peptide sequences against reference proteome (if requested)
+    if cfg["filter_seq_with_reference"]:
+        log.info("Filter variant peptides with reference proteome..")
+        proteome = prepare_reference_proteome(cfg)
+
+        # need a temp folder for the h5 chunks
+        os.makedirs(os.path.join(out_dir, "temp"), exist_ok=True)
+
+        h5_paths = multi_process("filter_seq_with_reference",
+                                 src_df, "sequences",
+                                 proteome, out_dir)
+
+        src_df = pd.concat(cast(List[pd.DataFrame], [pd.read_hdf(p) for p in h5_paths]), ignore_index=True)
+    elif proteome_available:
+        proteome = prepare_reference_proteome(cfg)
+
+    # add disease / variant annotation if enabled
+    if cfg["add_disease_info"]:
+        src_df_out = annotate_variant_info(src_df, join_key,
+                                           cfg["annotation_data"],
+                                           cfg["min_spec_pep_len"],
+                                           cfg["max_spec_pep_len"])
+        src_df_out.to_csv(os.path.join(out_dir,
+                        f"{ts}_disease_annotation_{fasta_tag}.tsv"), sep="\t")
+
+    # make fasta records
+    recs = convert_df_to_bio_list(src_df, seq_fmt,
+                                  cfg["min_spec_pep_len"],
+                                  cfg["max_spec_pep_len"],
+                                  cfg["keep_saav_dups_in_fasta"])
+
+    # write variant fasta
+    log.info(f"Save {fasta_tag} peptides as FASTA..")
+    write_fasta(recs, out_dir, ts, "SAAV_sequences", fasta_tag)
+
+    # write combined (reference + variant) fasta
+    prot_recs   = convert_df_to_bio_list(proteome, "uniprot")
+    combined    = prot_recs + recs
+    fasta_label = "subFASTA" if cfg["generate_subFASTA"] else "FASTA"
+    write_fasta(combined, out_dir, ts, f"{fasta_label}_SAAV", fasta_tag)
+
+    # combined (reference + variant) FASTA only if a proteome is available
+    if proteome_available and not proteome.empty:
+        prot_recs = convert_df_to_bio_list(proteome, "uniprot")
+        combined = prot_recs + recs
+        fasta_label = "subFASTA" if cfg["generate_subFASTA"] else "FASTA"
+        write_fasta(combined, out_dir, ts, f"{fasta_label}_SAAV", fasta_tag)
+
+        # optional standalone subproteome
+        if cfg["generate_subFASTA"]:
+            write_fasta(prot_recs, out_dir, ts, "subFASTA", fasta_tag)
+
+SOURCE_SPECS: List[SourceSpec] = [
+    SourceSpec("map_galaxy", load_galaxy, "Galaxy RNAseq mutations"),
+    SourceSpec("map_cosmic", load_cosmic, "COSMIC mutations"),
+    SourceSpec("map_tso", load_tso, "TSO500 mutations"),
+    SourceSpec("map_mfa", load_mfa, "MFA mutations"),
+    SourceSpec("map_strelka_vcf", load_strelka, "strelka mutations"),
+    SourceSpec("map_saav_list", load_saav_list, "SAAV list"),
+    SourceSpec("map_uniprot", load_uniprot,"UniProtID mutations"),
+    SourceSpec("map_enst", load_enst, "ENST mutations"),
+]
+
+
+def main() -> None:
     start_time = time.time()
-    timestamp_str = datetime.now().strftime("%y%m%d%H%M")
+    ts = datetime.now().strftime("%y%m%d%H%M")
 
-    # Add parser for config YAML input
+    # argument parsing
     parser = ArgumentParser()
-    parser.add_argument("-c", "--config",
-                        dest="config_yaml",
-                        default=None,
-                        help="Path to config YAML file")
-    arg_parser = parser.parse_args()
+    parser.add_argument("-c", "--config", dest="config_yaml",
+                        required=True, help="path to config YAML file")
+    args = parser.parse_args()
 
-    # print welcome message
+    # welcome banner
     print_welcome()
-
-    # Reformat log output
     stream.setFormatter(ColoredFormatter(LOGFORMAT, "%H:%M:%S"))
 
-    # load config YAML
-    if arg_parser.config_yaml:
-        config_yaml = read_yaml(arg_parser.config_yaml)
-        output_path = os.path.dirname(arg_parser.config_yaml)
-    else:
-        log.error("ProteoGenDB config YAML not found..")
-        sys.exit()
-
-    if config_yaml["map_galaxy"]:
-        # get fasta DB of proteogenomics Galaxy workflow
-        fasta_proteogen = read_fasta(config_yaml["fasta_proteogen_path"], "galaxy")
-
-        # annotate saavs
-        proteogen_saavs = annotate_saavs(fasta_proteogen, config_yaml)
-
-        # keep proteins which are present in reference dataset if provided
-        if config_yaml["reference_dataset"] != "":
-            log.info("Filter UniProt IDs with reference dataset..")
-            proteogen_saavs = filter_id_with_reference(proteogen_saavs, config_yaml)
-
-        # filter sequences against reference proteome
-        if config_yaml["filter_seq_with_reference"]:
-            log.info("Filter variant sequences with reference proteome..")
-            if config_yaml["generate_subFASTA"] and config_yaml["reference_dataset"] != "":
-                log.info("Generate subFASTA proteome..")
-                fasta_proteome = subset_fasta_db(config_yaml["reference_proteome"],
-                                                 config_yaml["reference_dataset"])
-            else:
-                fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
-
-            # create temp folder
-            if not os.path.exists(os.path.join(output_path, "temp")):
-                os.mkdir(os.path.join(output_path, "temp"))
-
-            proteogen_saavs_h5 = multi_process("filter_seq_with_reference",
-                                               proteogen_saavs,
-                                               "sequences",
-                                               fasta_proteome,
-                                               output_path)
-
-            proteogen_saavs = pd.DataFrame()
-
-            for h5_path in proteogen_saavs_h5:
-                h5_path_key = os.path.splitext(os.path.basename(h5_path))[0]
-                proteogen_saavs_var_temp = pd.read_hdf(h5_path,
-                                                       h5_path_key)
-                proteogen_saavs = pd.concat([proteogen_saavs, proteogen_saavs_var_temp])
-        else:
-            fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
-
-        # add disease information
-        if config_yaml["add_disease_info"]:
-            proteogen_saavs_out = annotate_variant_info(proteogen_saavs,
-                                                        "GeneID",
-                                                        config_yaml["annotation_data"],
-                                                        config_yaml["min_spec_pep_len"],
-                                                        config_yaml["max_spec_pep_len"]).to_csv(
-                os.path.join(output_path, "{}_disease_annotation_galaxy.tsv".format(timestamp_str)),
-                sep="\t")
-
-        # mapped SAAVS to FASTA
-        proteogen_saavs_list = convert_df_to_bio_list(proteogen_saavs,
-                                                      "galaxy",
-                                                      config_yaml["min_spec_pep_len"],
-                                                      config_yaml["max_spec_pep_len"],
-                                                      config_yaml["keep_saav_dups_in_fasta"])
-
-        # write to FASTA
-        log.info("Save annotated Galaxy SAAVs as FASTA..")
-        write_fasta(proteogen_saavs_list, output_path, timestamp_str, "SAAV_sequences", "galaxy")
-
-        fasta_proteome_name = os.path.basename(config_yaml["reference_proteome"]).split(".")[0]
-        fasta_output = convert_df_to_bio_list(fasta_proteome, "uniprot")
-        fasta_combined_output = fasta_output + proteogen_saavs_list
-
-        if config_yaml["generate_subFASTA"]:
-            log.info("Save subFASTA proteome..")
-
-            write_fasta(fasta_output, output_path, timestamp_str, "subFASTA", "galaxy")
-            write_fasta(fasta_combined_output, output_path, timestamp_str, "subFASTA_SAAV", "galaxy")
-        else:
-            log.info("Save FASTA proteome..")
-            write_fasta(fasta_combined_output, output_path, timestamp_str, "FASTA_SAAV", "galaxy")
-
-    if config_yaml["map_cosmic"]:
-        # get ensembl fasta
-        log.info("Load ENSEMBL fasta..")
-        fasta_ensembl = read_fasta(config_yaml["fasta_ensembl"], "ensembl")
-
-        # load CosmicMutantExport.tsv
-        # only load columns of interest
-        log.info("Load CosmicMutantExport.tsv..")
-        cosmic_coi = {
-            "Accession Number": "str",
-            "Sample name": "str",
-            "ID_sample": "int32",
-            "ID_tumour": "int32",
-            "Primary site": "str",
-            "Primary histology": "str",
-            "Histology subtype 1": "str",
-            "LEGACY_MUTATION_ID": "str",
-            "Mutation AA": "str",
-            "Resistance Mutation": "str",
-            "Mutation somatic status": "str",
-            "Pubmed_PMID": "int32",
-            "ID_STUDY": "int16",
-            "Sample Type": "str",
-            "Tumour origin": "str",
-            "HGVSP": "str"
-        }
-        cosmic_coi_keys = list(cosmic_coi.keys())
-
-        cosmic_data = pd.read_table(config_yaml["cosmic_mutant_export"],
-                                    usecols=cosmic_coi_keys,
-                                    encoding="cp1252")
-        if config_yaml["cosmic_primary_site_filter"]:
-            cosmic_primary_site_set = None
-
-            if not config_yaml["cosmic_primary_site_set"]:
-                cosmic_primary_site_select = True
-
-                # get all possible entries
-                cosmic_data_primary_sites = cosmic_data["Primary site"].unique().tolist()
-
-                # user input
-                log.info("Please select a primary site:")
-                cosmic_data_primary_sites_len = len(cosmic_data_primary_sites)
-                for i in range(0, len(cosmic_data_primary_sites), 2):
-                    if not i == cosmic_data_primary_sites_len-1 or not cosmic_data_primary_sites_len % 2 == 1:
-                        log.info("\t{}. {} | {}. {}".format(i, cosmic_data_primary_sites[i],
-                                                            i + 1, cosmic_data_primary_sites[i + 1]))
-                    else:
-                        log.info("\t{}. {}".format(i, cosmic_data_primary_sites[i]))
-                while cosmic_primary_site_select:
-                    cosmic_primary_site_set = input("Select ID: ")
-                    try:
-                        cosmic_primary_site_set = cosmic_data_primary_sites[int(cosmic_primary_site_set)]
-                        cosmic_primary_site_select = False
-                    except ValueError:
-                        log.error("Error: Type in a number!")
-                    except IndexError:
-                        log.error("Error: ID not in list!")
-            else:
-                cosmic_primary_site_set = config_yaml["cosmic_primary_site_set"]
-
-            cosmic_data = cosmic_data[cosmic_data["Primary site"] == cosmic_primary_site_set]
-
-        cosmic_data_ensp = cosmic_data[cosmic_data.HGVSP.notnull()].filter(["LEGACY_MUTATION_ID",
-                                                                            "Mutation AA",
-                                                                            "HGVSP"])
-        # Free memory
-        del cosmic_data
-
-        cosmic_data_ensp["ProteinID"] = cosmic_data_ensp["HGVSP"].str.split(":").str[0]
-        cosmic_data_ensp["VariantPos"] = cosmic_data_ensp["Mutation AA"].str.split("p.").str[1]
-        cosmic_data_ensp = cosmic_data_ensp.rename(columns={"LEGACY_MUTATION_ID": "CosmicID"})
-
-        # Filter
-        cosmic_data_ensp_filt = cosmic_data_ensp.filter(["CosmicID", "ProteinID", "VariantPos"])
-
-        # deduplicate
-        cosmic_data_ensp_filt = cosmic_data_ensp_filt.drop_duplicates()
-
-        # Free memory
-        del cosmic_data_ensp
-
-        # drop all coding silent substitutions, deletions, insertions, duplications, frameshifts
-        cosmic_data_ensp_filt = cosmic_data_ensp_filt[~cosmic_data_ensp_filt["VariantPos"].str.contains(
-            "=|del|ins|dup|fs|ext|Sec|\\?",
-            case=False)
-        ]
-
-        # move VariantPos values in list
-        cosmic_data_ensp_filt["VariantPos"] = cosmic_data_ensp_filt["VariantPos"].apply(lambda x: [x])
-
-        # add protein sequence
-        cosmic_data_ensp_filt = cosmic_data_ensp_filt.merge(fasta_ensembl[["ProteinID", "Sequence"]],
-                                                            on='ProteinID',
-                                                            how='left')
-        cosmic_data_ensp_filt_nan = cosmic_data_ensp_filt[cosmic_data_ensp_filt["Sequence"].isnull()]
-
-        # get peptides
-        log.info("Mutate ENSEMBL sequence with COSMIC mutations..")
-        cosmic_data_ensp_filt_mut = multi_process("process_mutation",
-                                                  cosmic_data_ensp_filt,
-                                                  "COSMIC mutations",
-                                                  config_yaml)
-        log.info("Get COSMIC peptide variants..")
-        cosmic_data_ensp_filt_var = multi_process("process_saavs",
-                                                  cosmic_data_ensp_filt_mut,
-                                                  "COSMIC variants",
-                                                  config_yaml)
-
-        # get UniProt IDs via ENSP ID
-        log.info("Map UniProt IDs to ENSEMBL IDs..")
-        cosmic_mutant_export_ensp_filt_ids = cosmic_data_ensp_filt["ProteinID"].tolist()
-        cosmic_mutant_export_ensp_filt_ids_unique = cosmic_data_ensp_filt[
-            ~cosmic_data_ensp_filt["ProteinID"].duplicated()
-        ]["ProteinID"].tolist()
-
-        uniprot_lookup = get_uniprot_id(cosmic_mutant_export_ensp_filt_ids_unique).rename({"FromID": "ProteinID",
-                                                                                           "ToID": "UniProtID"},
-                                                                                          axis=1)
-        uniprot_lookup["ProteinID"].apply(lambda x: x[:15])
-
-        # Free memory
-        del cosmic_data_ensp_filt
-
-        # get UniProt IDs via ENSP ID without subversion
-        uniprot_nan = list(dict.fromkeys(cosmic_data_ensp_filt_var["ProteinID"][
-                                             ~cosmic_data_ensp_filt_var["ProteinID"].isin(uniprot_lookup["ProteinID"])
-                                         ].tolist()))
-        uniprot_nan_split = [ensp_id.split(".", 1)[0] for ensp_id in uniprot_nan]
-        uniprot_lookup_nan = get_uniprot_id(uniprot_nan_split).rename({"FromID": "ProteinID",
-                                                                       "ToID": "UniProtID"},
-                                                                      axis=1)
-
-        # concat both lookup dataframes
-        uniprot_lookup = pd.concat([uniprot_lookup, uniprot_lookup_nan])
-
-        # map UniProt IDs with lookup table
-        cosmic_data_ensp_filt_var["UniProtID"] = multi_process("process_uniprot_ids",
-                                                               cosmic_mutant_export_ensp_filt_ids,
-                                                               "ids",
-                                                               uniprot_lookup)
-        cosmic_data_ensp_filt_var["UniProtID"] = cosmic_data_ensp_filt_var["UniProtID"].replace("", "NoUniID")
-
-        cosmic_data_ensp_filt_var_len = len(cosmic_data_ensp_filt_var["UniProtID"][
-                                                cosmic_data_ensp_filt_var["UniProtID"] != "NoUniID"
-                                                ])
-
-        # keep proteins which are present in reference dataset if provided
-        if config_yaml["reference_dataset"] != "":
-            log.info("Filter UniProt IDs with reference dataset..")
-            cosmic_data_ensp_filt_var = filter_id_with_reference(cosmic_data_ensp_filt_var, config_yaml)
-
-        # filter sequences against reference proteome
-        if config_yaml["filter_seq_with_reference"]:
-            log.info("Filter variant sequences with reference proteome..")
-            if config_yaml["generate_subFASTA"] and config_yaml["reference_dataset"] != "":
-                log.info("Generate subFASTA proteome..")
-                fasta_proteome = subset_fasta_db(config_yaml["reference_proteome"],
-                                                 config_yaml["reference_dataset"])
-            else:
-                fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
-
-            # create temp folder
-            if not os.path.exists(os.path.join(output_path, "temp")):
-                os.mkdir(os.path.join(output_path, "temp"))
-
-            cosmic_data_ensp_filt_var_h5 = multi_process("filter_seq_with_reference",
-                                                         cosmic_data_ensp_filt_var,
-                                                         "sequences",
-                                                         fasta_proteome,
-                                                         output_path)
-
-            cosmic_data_ensp_filt_var = pd.DataFrame()
-
-            for h5_path in cosmic_data_ensp_filt_var_h5:
-                h5_path_key = os.path.splitext(os.path.basename(h5_path))[0]
-                cosmic_data_ensp_filt_var_temp = pd.read_hdf(h5_path,
-                                                             h5_path_key)
-                cosmic_data_ensp_filt_var = pd.concat([cosmic_data_ensp_filt_var, cosmic_data_ensp_filt_var_temp])
-        else:
-            fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
-
-        # add disease information
-        if config_yaml["add_disease_info"]:
-            cosmic_data_ensp_filt_var_out = annotate_variant_info(cosmic_data_ensp_filt_var,
-                                                                  "CosmicID",
-                                                                  config_yaml["annotation_data"],
-                                                                  config_yaml["min_spec_pep_len"],
-                                                                  config_yaml["max_spec_pep_len"]).to_csv(
-                os.path.join(output_path, "{}_disease_annotation_cosmic.tsv".format(timestamp_str)),
-                sep="\t")
-
-        # mapped SAAVS to FASTA
-        cosmic_data_ensp_filt_var_list = convert_df_to_bio_list(cosmic_data_ensp_filt_var,
-                                                                "cosmic",
-                                                                config_yaml["min_spec_pep_len"],
-                                                                config_yaml["max_spec_pep_len"],
-                                                                config_yaml["keep_saav_dups_in_fasta"])
-
-        # write to FASTA
-        log.info("Save annotated COSMIC SAAVs as FASTA..")
-        write_fasta(cosmic_data_ensp_filt_var_list, output_path, timestamp_str, "SAAV_sequences", "cosmic")
-
-        fasta_proteome_name = os.path.basename(config_yaml["reference_proteome"]).split(".")[0]
-        fasta_output = convert_df_to_bio_list(fasta_proteome, "uniprot")
-        fasta_combined_output = fasta_output + cosmic_data_ensp_filt_var_list
-
-        if config_yaml["generate_subFASTA"]:
-            log.info("Save subFASTA proteome..")
-
-            write_fasta(fasta_output, output_path, timestamp_str, "subFASTA", "cosmic")
-            write_fasta(fasta_combined_output, output_path, timestamp_str, "subFASTA_SAAV", "cosmic")
-        else:
-            log.info("Save FASTA proteome..")
-            write_fasta(fasta_combined_output, output_path, timestamp_str, "FASTA_SAAV", "cosmic")
-
-    if config_yaml["map_tso"]:
-        log.info("Load CombinedVariantOutput of TSO 500 pipeline..")
-        tso_data = read_tso(config_yaml["tso_path"])
-
-        # if no TSO data is present, skip the following steps
-        if tso_data.empty:
-            log.error("No variants in TSO data..")
-        else:
-            # mutate
-            log.info("Mutate NCBI sequences with TSO mutations..")
-            tso_data_mut = multi_process("process_mutation",
-                                         tso_data,
-                                         "TSO mutations",
-                                         config_yaml)
-
-            # process saavs
-            log.info("Process TSO mutations..")
-            tso_data_processed = multi_process("process_saavs",
-                                               tso_data_mut,
-                                               "variants",
-                                               config_yaml)
-
-            # get UniProt IDs via NCBI ID
-            log.info("Map UniProt IDs to ENSEMBL IDs..")
-            tso_prot_ids_unique = tso_data_processed[
-                ~tso_data_processed["ProteinID"].duplicated()
-            ]["ProteinID"].tolist()
-
-            uniprot_lookup = get_uniprot_id(tso_prot_ids_unique,
-                                            fmt_from="RefSeq_Protein",
-                                            split_str=" ").rename({"FromID": "ProteinID",
-                                                                  "ToID": "UniProtID"},
-                                                                  axis=1)
-            uniprot_lookup["ProteinID"].apply(lambda x: x[:15])
-
-            # map UniProt IDs with lookup table
-            tso_data_processed["UniProtID"] = multi_process("process_uniprot_ids",
-                                                            tso_data_processed["ProteinID"],
-                                                            "ids",
-                                                            uniprot_lookup)
-
-            tso_data_processed["UniProtID"] = tso_data_processed["UniProtID"].replace("", "NoUniID")
-
-            # keep proteins which are present in reference dataset if provided
-            if config_yaml["reference_dataset"] != "":
-                log.info("Filter UniProt IDs with reference dataset..")
-                tso_data_processed = filter_id_with_reference(tso_data_processed, config_yaml)
-
-            # filter sequences against reference proteome
-            if config_yaml["filter_seq_with_reference"]:
-                log.info("Filter variant sequences with reference proteome..")
-                if config_yaml["generate_subFASTA"] and config_yaml["reference_dataset"] != "":
-                    log.info("Generate subFASTA proteome..")
-                    fasta_proteome = subset_fasta_db(config_yaml["reference_proteome"],
-                                                     config_yaml["reference_dataset"])
-                else:
-                    fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
-
-                # create temp folder
-                if not os.path.exists(os.path.join(output_path, "temp")):
-                    os.mkdir(os.path.join(output_path, "temp"))
-
-                tso_data_processed_h5 = multi_process("filter_seq_with_reference",
-                                                      tso_data_processed,
-                                                      "sequences",
-                                                      fasta_proteome,
-                                                      output_path)
-
-                tso_data_processed = pd.DataFrame()
-
-                for h5_path in tso_data_processed_h5:
-                    h5_path_key = os.path.splitext(os.path.basename(h5_path))[0]
-                    tso_data_processed_var_temp = pd.read_hdf(h5_path,
-                                                              h5_path_key)
-                    tso_data_processed = pd.concat([tso_data_processed, tso_data_processed_var_temp])
-            else:
-                fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
-
-            # add disease information
-            if config_yaml["add_disease_info"]:
-                tso_data_processed_out = annotate_variant_info(tso_data_processed,
-                                                               "Gene",
-                                                               config_yaml["annotation_data"],
-                                                               config_yaml["min_spec_pep_len"],
-                                                               config_yaml["max_spec_pep_len"]).to_csv(
-                    os.path.join(output_path, "{}_disease_annotation_tso.tsv".format(timestamp_str)),
-                    sep="\t")
-
-            # mapped SAAVS to FASTA
-            tso_data_processed_list = convert_df_to_bio_list(tso_data_processed,
-                                                             "tso",
-                                                             config_yaml["min_spec_pep_len"],
-                                                             config_yaml["max_spec_pep_len"],
-                                                             config_yaml["keep_saav_dups_in_fasta"])
-
-            # write to FASTA
-            log.info("Save annotated TSO SAAVs as FASTA..")
-            write_fasta(tso_data_processed_list, output_path, timestamp_str, "SAAV_sequences", "tso")
-
-            fasta_proteome_name = os.path.basename(config_yaml["reference_proteome"]).split(".")[0]
-            fasta_output = convert_df_to_bio_list(fasta_proteome, "uniprot")
-            fasta_combined_output = fasta_output + tso_data_processed_list
-
-            if config_yaml["generate_subFASTA"]:
-                log.info("Save subFASTA proteome..")
-
-                write_fasta(fasta_output, output_path, timestamp_str, "subFASTA", "tso")
-                write_fasta(fasta_combined_output, output_path, timestamp_str, "subFASTA_SAAV", "tso")
-            else:
-                log.info("Save FASTA proteome..")
-                write_fasta(fasta_combined_output, output_path, timestamp_str, "FASTA_SAAV", "tso")
-
-    if config_yaml["map_isoforms"]:
-        # read related isoforms
-        fasta_isoforms = read_fasta(config_yaml["fasta_isoforms_path"], "uniprot")
-
-        # only keep "Isoform of"
-        if config_yaml["drop_unmapped_isoforms"]:
-            fasta_isoforms = fasta_isoforms[fasta_isoforms.Description.str.contains("Isoform of")]
-            fasta_isoforms['Consensus'] = fasta_isoforms.Description.str.extract('Isoform of (\w+),')
-
-        # drop unreviewed
-        if config_yaml["drop_unreviewed_isoforms"]:
-            fasta_isoforms = fasta_isoforms[~fasta_isoforms['Description'].str.startswith('tr')]
-
-        # digest isoforms to peptides
-        fasta_df_iso = multi_process("process_isoforms", fasta_isoforms, "isoforms", config_yaml)
-
-        # deduplicate peptides (intrinsically)
-        fasta_df_iso_exp = fasta_df_iso.explode('VarSeqCleave')
-        fasta_df_iso_unique = fasta_df_iso_exp.drop_duplicates(subset=['VarSeqCleave']).dropna(subset=['VarSeqCleave'])
-
-        # aggregating "VarSeqCleave" into a list
-        if config_yaml["drop_unmapped_isoforms"]:
-            fasta_df_iso_grouped = fasta_df_iso_unique.groupby("UniProtID").agg(
-                {"VarSeqCleave": list, "Consensus": "first"}
-            ).reset_index()
-        else:
-            fasta_df_iso_grouped = fasta_df_iso_unique.groupby("UniProtID").agg(
-                {"VarSeqCleave": list}
-            ).reset_index()
-
-        def sequences_to_dicts(sequences):
-            return [{i + 1: seq} for i, seq in enumerate(sequences)]
-
-        fasta_df_iso_grouped["VarSeqCleave"] = fasta_df_iso_grouped["VarSeqCleave"].apply(sequences_to_dicts)
-
-        fasta_df_iso_dict = fasta_df_iso_grouped.explode('VarSeqCleave').reset_index(drop=True)
-        fasta_df_iso_dict["VarSeqCleave"] = fasta_df_iso_dict["VarSeqCleave"].apply(lambda x: [x])
-
-        # keep isoforms which are present in reference dataset if provided
-        if config_yaml["reference_dataset"] != "" and config_yaml["drop_unmapped_isoforms"]:
-            log.info("Filter Isoforms with reference dataset..")
-            fasta_df_iso_dict = filter_id_with_reference(fasta_df_iso_dict, config_yaml, "Consensus")
-
-        # ToDo: write function
-        # filter sequences against reference proteome
-        if config_yaml["filter_seq_with_reference"]:
-            log.info("Filter variant sequences with reference proteome..")
-            if config_yaml["generate_subFASTA"] and config_yaml["reference_dataset"] != "":
-                log.info("Generate subFASTA proteome..")
-                fasta_proteome = subset_fasta_db(config_yaml["reference_proteome"],
-                                                 config_yaml["reference_dataset"])
-            else:
-                fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
-
-            # create temp folder
-            if not os.path.exists(os.path.join(output_path, "temp")):
-                os.mkdir(os.path.join(output_path, "temp"))
-
-            var_data_processed_h5 = multi_process("filter_seq_with_reference",
-                                                  fasta_df_iso_dict,
-                                                  "sequences",
-                                                  fasta_proteome,
-                                                  output_path)
-
-            var_data_processed = pd.DataFrame()
-
-            for h5_path in var_data_processed_h5:
-                h5_path_key = os.path.splitext(os.path.basename(h5_path))[0]
-                var_data_processed_var_temp = pd.read_hdf(h5_path,
-                                                          h5_path_key)
-                var_data_processed = pd.concat([var_data_processed, var_data_processed_var_temp])
-        else:
-            fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
-
-        # rank peptides per occurance in isoform
-        var_data_processed['VarSeqCleave'] = var_data_processed['VarSeqCleave'].apply(
-            lambda x: list(x[0].values())[0]
-        )
-        var_data_processed['Order'] = var_data_processed.groupby('UniProtID').cumcount() + 1
-        var_data_processed['VarSeqCleave'] = var_data_processed.apply(
-            lambda x: [{x['Order']: x['VarSeqCleave']}], axis=1
-        )
-        var_data_processed.drop('Order', axis=1, inplace=True)
-
-        # mapped SAAVS to FASTA
-        iso_data_processed_list = convert_df_to_bio_list(var_data_processed,
-                                                         "isoform",
-                                                         config_yaml["min_spec_pep_len"],
-                                                         config_yaml["max_spec_pep_len"],
-                                                         config_yaml["keep_saav_dups_in_fasta"])
-
-        # write to FASTA
-        log.info("Save isoform peptides as FASTA..")
-        write_fasta(iso_data_processed_list, output_path, timestamp_str, "isoform_sequences", "iso")
-
-        fasta_proteome_name = os.path.basename(config_yaml["reference_proteome"]).split(".")[0]
-        fasta_output = convert_df_to_bio_list(fasta_proteome, "uniprot")
-        fasta_combined_output = fasta_output + iso_data_processed_list
-
-        if config_yaml["generate_subFASTA"]:
-            log.info("Save subFASTA proteome..")
-
-            write_fasta(fasta_output, output_path, timestamp_str, "subFASTA", "iso")
-            write_fasta(fasta_combined_output, output_path, timestamp_str, "subFASTA_isoform_sequences", "iso")
-        else:
-            log.info("Save FASTA proteome..")
-            write_fasta(fasta_combined_output, output_path, timestamp_str, "FASTA_isoform_sequences", "iso")
-
-    if config_yaml["map_mfa"]:
-        # read mfa
-        mfa_data = pd.read_table(config_yaml["mfa_path"])
-
-        # columns to keep: gene_name, Variant_Classification, tx, aaChange, ExonicFunc.refGene, TumorVAF
-        mfa_data = mfa_data[["gene_name", "Variant_Classification", "tx", "txChange", "aaChange", "ExonicFunc.refGene", "TumorVAF"]]
-
-        # drop nan in aaChange and txChange
-        mfa_data = mfa_data.dropna(subset=["aaChange", "txChange"])
-
-        # keep nonsynonymous SNV
-        mfa_data = mfa_data[mfa_data["ExonicFunc.refGene"].isin(["nonsynonymous SNV", "stopgain"])]
-
-        # drop rows where txChange contains an "_"
-        mfa_data = mfa_data[~mfa_data["txChange"].str.contains("_")]
-
-        # change X to * in aaChange
-        mfa_data["aaChange"] = mfa_data["aaChange"].str.replace("X", "*")
-
-        # filter for VAF (according to config.yaml value)
-        mfa_data = mfa_data[mfa_data["TumorVAF"] >= config_yaml["mfa_vaf_cutoff"]]
-
-        # strip p. from aaChange
-        mfa_data["aaChange"] = mfa_data["aaChange"].str.replace("p.", "")
-
-        # rename aaChange to VariantPos
-        mfa_data = mfa_data.rename(columns={"aaChange": "VariantPos"})
-
-        # uniprot lookup of ENSG IDs
-        uniprot_lookup = get_uniprot_id(mfa_data["gene_name"].drop_duplicates(), fmt_from="Ensembl").rename(
-            {"FromID": "GeneID",
-             "ToID": "UniProtID"},
-            axis=1).reset_index(drop=True)
-
-        # get protein sequence from NCBI as SeqRecord
-        uniprot_lookup["Sequence"] = multi_process("fetch_fasta", uniprot_lookup["UniProtID"].tolist(), "ids", "uniprot")
-
-        # drop nan in Sequence
-        uniprot_lookup = uniprot_lookup.dropna(subset=["Sequence"]).reset_index(drop=True)
-
-        # map gene_name to UniProtID and add sequence
-        mfa_data = mfa_data.merge(uniprot_lookup, left_on="gene_name", right_on="GeneID", how="left")
-
-        # drop nan in GeneID
-        mfa_data = mfa_data.dropna(subset=["GeneID"])
-
-        # put VariantPos in list
-        mfa_data["VariantPos"] = mfa_data["VariantPos"].apply(lambda x: [x])
-
-        # mutate
-        log.info("Mutate NCBI sequences with MFA mutations..")
-        mfa_data_mut = multi_process("process_mutation",
-                                     mfa_data,
-                                     "mutations",
-                                     config_yaml)
-
-        # process saavs
-        log.info("Process MFA mutations..")
-        mfa_data_processed = multi_process("process_saavs",
-                                           mfa_data_mut,
-                                           "variants",
-                                           config_yaml)
-
-        # drop nan in Sequence
-        mfa_data_processed = mfa_data_processed.dropna(subset=["Sequence"]).reset_index(drop=True)
-
-        # keep proteins which are present in reference dataset if provided
-        if config_yaml["reference_dataset"] != "":
-            log.info("Filter UniProt IDs with reference dataset..")
-            mfa_data_processed = filter_id_with_reference(mfa_data_processed, config_yaml)
-
-        # filter sequences against reference proteome
-        if config_yaml["filter_seq_with_reference"]:
-            log.info("Filter variant sequences with reference proteome..")
-            if config_yaml["generate_subFASTA"] and config_yaml["reference_dataset"] != "":
-                log.info("Generate subFASTA proteome..")
-                fasta_proteome = subset_fasta_db(config_yaml["reference_proteome"],
-                                                 config_yaml["reference_dataset"])
-            else:
-                fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
-
-            # create temp folder
-            if not os.path.exists(os.path.join(output_path, "temp")):
-                os.mkdir(os.path.join(output_path, "temp"))
-
-            mfa_data_processed_h5 = multi_process("filter_seq_with_reference",
-                                                  mfa_data_processed,
-                                                  "sequences",
-                                                  fasta_proteome,
-                                                  output_path)
-
-            mfa_data_processed = pd.DataFrame()
-
-            for h5_path in mfa_data_processed_h5:
-                h5_path_key = os.path.splitext(os.path.basename(h5_path))[0]
-                mfa_data_processed_var_temp = pd.read_hdf(h5_path,
-                                                          h5_path_key)
-                mfa_data_processed = pd.concat([mfa_data_processed, mfa_data_processed_var_temp])
-        else:
-            fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
-
-        # add disease information
-        if config_yaml["add_disease_info"]:
-            mfa_data_processed_out = annotate_variant_info(mfa_data_processed,
-                                                           "Gene",
-                                                           config_yaml["annotation_data"],
-                                                           config_yaml["min_spec_pep_len"],
-                                                           config_yaml["max_spec_pep_len"]).to_csv(
-                os.path.join(output_path, "{}_disease_annotation_mfa.tsv".format(timestamp_str)),
-                sep="\t")
-
-        # mapped SAAVS to FASTA
-        mfa_data_processed_list = convert_df_to_bio_list(mfa_data_processed,
-                                                         "mfa",
-                                                         config_yaml["min_spec_pep_len"],
-                                                         config_yaml["max_spec_pep_len"],
-                                                         config_yaml["keep_saav_dups_in_fasta"])
-
-        # write to FASTA
-        log.info("Save annotated MFA SAAVs as FASTA..")
-        write_fasta(mfa_data_processed_list, output_path, timestamp_str, "SAAV_sequences", "mfa")
-
-        fasta_proteome_name = os.path.basename(config_yaml["reference_proteome"]).split(".")[0]
-        fasta_output = convert_df_to_bio_list(fasta_proteome, "uniprot")
-        fasta_combined_output = fasta_output + mfa_data_processed_list
-
-        if config_yaml["generate_subFASTA"]:
-            log.info("Save subFASTA proteome..")
-
-            write_fasta(fasta_output, output_path, timestamp_str, "subFASTA", "mfa")
-            write_fasta(fasta_combined_output, output_path, timestamp_str, "subFASTA_SAAV", "mfa")
-        else:
-            log.info("Save FASTA proteome..")
-            write_fasta(fasta_combined_output, output_path, timestamp_str, "FASTA_SAAV", "mfa")
-
-    # consider use_uniprot_reviewed: True
-    if config_yaml["map_uniprot"]:
-        # read ids from reference_dataset
-        ref_df_sep = pd.read_table(config_yaml["reference_dataset"], sep=None, iterator=True, engine="python")
-        ref_df_sep_det = ref_df_sep._engine.data.dialect.delimiter
-        ref_df = pd.read_table(config_yaml["reference_dataset"], sep=ref_df_sep_det)
-
-        # read first column
-        ref_df_ids = ref_df[ref_df.columns[0]]
-
-        # get uniprot saavs from reference dataset
-        log.info("Get mutations from UniProt..")
-        uniprot_saavs_data = multi_process("get_annotation_data",
-                                           ref_df_ids,
-                                           "UniProtID",
-                                           "ebi",
-                                           "https://www.ebi.ac.uk/proteins/api/variation/{pid}",
-                                           config_yaml["annotation_data"])
-
-        log.info("Process UniProt mutations data..")
-        uniprot_saavs_data = multi_process("get_variant_info",
-                                           uniprot_saavs_data,
-                                           "GeneID",
-                                           config_yaml)
-
-        # get sequence via uniprot_lookup
-        fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")[['Identifier', 'Sequence']]
-
-        # add sequences to df
-        uniprot_saavs_data = pd.merge(uniprot_saavs_data, fasta_proteome,
-                                      left_on="DL_UniProtID", right_on="Identifier",
-                                      how="left")
-
-        # drop "Identifier"
-        uniprot_saavs_data = uniprot_saavs_data.drop(columns=["Identifier"])
-
-        # rename columns
-        uniprot_saavs_data = uniprot_saavs_data.rename(columns={"DL_UniProtID": "UniProtID",
-                                                                "DL_VariantPos": "VariantPos",
-                                                                "DL_ftID": "VariantID"})
-        # drop all other columns
-        uniprot_saavs_data = uniprot_saavs_data[["UniProtID", "VariantPos", "VariantID", "Sequence"]]
-
-        # drop when VariantPos list is empty
-        uniprot_saavs_data = uniprot_saavs_data[uniprot_saavs_data["VariantPos"].apply(lambda x: len(x) > 0)]
-
-        # mutate
-        log.info("Generate peptide variants of UniProt mutations..")
-        uniprot_saavs_data = multi_process("process_mutation",
-                                           uniprot_saavs_data,
-                                           "UniProt mutations",
-                                           config_yaml)
-
-        log.info("Process peptide variants..")
-        uniprot_saavs_data = multi_process("process_saavs",
-                                           uniprot_saavs_data,
-                                           "variants",
-                                           config_yaml)
-
-        # filter sequences against reference proteome
-        if config_yaml["filter_seq_with_reference"]:
-            log.info("Filter variant sequences with reference proteome..")
-            if config_yaml["generate_subFASTA"] and config_yaml["reference_dataset"] != "":
-                log.info("Generate subFASTA proteome..")
-                fasta_proteome = subset_fasta_db(config_yaml["reference_proteome"],
-                                                 config_yaml["reference_dataset"])
-            else:
-                fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
-
-            # create temp folder
-            if not os.path.exists(os.path.join(output_path, "temp")):
-                os.mkdir(os.path.join(output_path, "temp"))
-
-            uniprot_saavs_h5 = multi_process("filter_seq_with_reference",
-                                             uniprot_saavs_data,
-                                             "sequences",
-                                             fasta_proteome,
-                                             output_path)
-
-            uniprot_saavs_data = pd.DataFrame()
-
-            for h5_path in uniprot_saavs_h5:
-                h5_path_key = os.path.splitext(os.path.basename(h5_path))[0]
-                uniprot_saavs_var_temp = pd.read_hdf(h5_path,
-                                                     h5_path_key)
-                uniprot_saavs_data = pd.concat([uniprot_saavs_data, uniprot_saavs_var_temp])
-        else:
-            fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
-
-        # add disease information
-        if config_yaml["add_disease_info"]:
-            uniprot_saavs_out = annotate_variant_info(uniprot_saavs_data,
-                                                      "GeneID",
-                                                      config_yaml["annotation_data"],
-                                                      config_yaml["min_spec_pep_len"],
-                                                      config_yaml["max_spec_pep_len"]).to_csv(
-                os.path.join(output_path, "{}_disease_annotation_uniprot.tsv".format(timestamp_str)),
-                sep="\t")
-
-        # mapped SAAVS to FASTA
-        uniprot_saavs_list = convert_df_to_bio_list(uniprot_saavs_data,
-                                                   "uniprot_mut",
-                                                   config_yaml["min_spec_pep_len"],
-                                                   config_yaml["max_spec_pep_len"],
-                                                   config_yaml["keep_saav_dups_in_fasta"])
-
-        # write to FASTA
-        log.info("Save annotated UniProt SAAVs as FASTA..")
-        write_fasta(uniprot_saavs_list, output_path, timestamp_str, "SAAV_sequences", "uniprot")
-
-        fasta_proteome_name = os.path.basename(config_yaml["reference_proteome"]).split(".")[0]
-        fasta_output = convert_df_to_bio_list(fasta_proteome, "uniprot")
-        fasta_combined_output = fasta_output + uniprot_saavs_list
-
-        if config_yaml["generate_subFASTA"]:
-            log.info("Save subFASTA proteome..")
-
-            write_fasta(fasta_output, output_path, timestamp_str, "subFASTA", "uniprot")
-            write_fasta(fasta_combined_output, output_path, timestamp_str, "subFASTA_SAAV", "uniprot")
-
-        else:
-            log.info("Save FASTA proteome..")
-            write_fasta(fasta_combined_output, output_path, timestamp_str, "FASTA_SAAV", "uniprot")
-
-    if config_yaml["map_saav_list"]:
-        log.info("Processing SAAV list...")
-        saav_list_data = read_saav_list(config_yaml["saav_list_path"])
-
-        # get protein sequences
-        log.info("Fetching protein sequences for SAAVs...")
-
-        # unique UniProt IDs
-        saav_list_data_uniprot_ids = saav_list_data["UniProtID"].drop_duplicates().tolist()
-
-        saav_list_data_sequences = multi_process("fetch_fasta",
-                                                 saav_list_data_uniprot_ids,
-                                                 "ids",
-                                                 "uniprot")
-
-        # merge saav_list_data_uniprot_ids and saav_list_data_sequences in dataframe
-        saav_list_data_sequences_df = pd.DataFrame(
-            list(zip(saav_list_data_uniprot_ids, saav_list_data_sequences)),
-            columns=["UniProtID", "Sequence"]
-        )
-
-        # merge saav_list_data and saav_list_data_sequences_df
-        saav_list_data = saav_list_data.merge(saav_list_data_sequences_df, on="UniProtID", how="left")
-
-        # mutate sequences
-        log.info("Generating mutated sequences...")
-        saav_list_data_mut = multi_process("process_mutation",
-                                           saav_list_data,
-                                           "SAAV list mutations",
-                                           config_yaml)
-
-        # process SAAVs
-        log.info("Processing SAAV list mutations...")
-        saav_list_data_processed = multi_process("process_saavs",
-                                                 saav_list_data_mut,
-                                                 "variants",
-                                                 config_yaml)
-
-        # filter sequences against reference proteome
-        if config_yaml["filter_seq_with_reference"]:
-            log.info("Filter variant sequences with reference proteome...")
-            if config_yaml["generate_subFASTA"] and config_yaml["reference_dataset"] != "":
-                log.info("Generate subFASTA proteome...")
-                fasta_proteome = subset_fasta_db(config_yaml["reference_proteome"],
-                                                 config_yaml["reference_dataset"])
-            else:
-                fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
-
-            # create temp folder
-            if not os.path.exists(os.path.join(output_path, "temp")):
-                os.mkdir(os.path.join(output_path, "temp"))
-
-            saav_list_data_processed_h5 = multi_process("filter_seq_with_reference",
-                                                        saav_list_data_processed,
-                                                        "sequences",
-                                                        fasta_proteome,
-                                                        output_path)
-
-            saav_list_data_processed = pd.DataFrame()
-
-            for h5_path in saav_list_data_processed_h5:
-                h5_path_key = os.path.splitext(os.path.basename(h5_path))[0]
-                saav_list_data_processed_var_temp = pd.read_hdf(h5_path,
-                                                                h5_path_key)
-                saav_list_data_processed = pd.concat([saav_list_data_processed, saav_list_data_processed_var_temp])
-        else:
-            fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
-
-        # add disease information
-        if config_yaml["add_disease_info"]:
-            saav_list_data_processed_out = annotate_variant_info(saav_list_data_processed,
-                                                                 "UniProtID",
-                                                                 config_yaml["annotation_data"],
-                                                                 config_yaml["min_spec_pep_len"],
-                                                                 config_yaml["max_spec_pep_len"]).to_csv(
-                os.path.join(output_path, "{}_disease_annotation_saav_list.tsv".format(timestamp_str)),
-                sep="\t")
-
-        # map SAAVs to FASTA
-        saav_list_data_processed_list = convert_df_to_bio_list(saav_list_data_processed,
-                                                               "uniprot_mut",
-                                                               config_yaml["min_spec_pep_len"],
-                                                               config_yaml["max_spec_pep_len"],
-                                                               config_yaml["keep_saav_dups_in_fasta"])
-
-        # write to FASTA
-        log.info("Save annotated SAAV list as FASTA...")
-        write_fasta(saav_list_data_processed_list, output_path, timestamp_str, "SAAV_sequences", "saav_list")
-
-        fasta_proteome_name = os.path.basename(config_yaml["reference_proteome"]).split(".")[0]
-        fasta_output = convert_df_to_bio_list(fasta_proteome, "uniprot")
-        fasta_combined_output = fasta_output + saav_list_data_processed_list
-
-        if config_yaml["generate_subFASTA"]:
-            log.info("Save subFASTA proteome...")
-            write_fasta(fasta_output, output_path, timestamp_str, "subFASTA", "saav_list")
-            write_fasta(fasta_combined_output, output_path, timestamp_str, "subFASTA_SAAV", "saav_list")
-        else:
-            log.info("Save FASTA proteome...")
-            write_fasta(fasta_combined_output, output_path, timestamp_str, "FASTA_SAAV", "saav_list")
-
-    if config_yaml["map_strelka_vcf"]:
-        log.info("Processing Strelka VCF file...")
-        strelka_data = read_strelka_vcf(config_yaml["strelka_vcf_path"])
-
-        # fetch protein sequences
-        log.info("Fetching protein sequences for Strelka variants...")
-        strelka_data_uniprot_ids = strelka_data["ProteinID"].drop_duplicates().tolist()
-        strelka_data_sequences = multi_process("fetch_fasta",
-                                               strelka_data_uniprot_ids,
-                                               "ids",
-                                               "ncbi_NM",
-                                               config_yaml["ncbi_api_key"])
-
-        # merge sequences with variant data
-        strelka_data_sequences_df = pd.DataFrame(
-            list(zip(strelka_data_uniprot_ids, strelka_data_sequences)),
-            columns=["ProteinID", "Sequence"]
-        )
-        strelka_data = strelka_data.merge(strelka_data_sequences_df, on="ProteinID", how="left")
-
-        # mutate sequences
-        log.info("Generating mutated sequences...")
-        strelka_data_mut = multi_process("process_mutation",
-                                         strelka_data,
-                                         "mutations",
-                                         config_yaml)
-
-        # process SAAVs
-        log.info("Processing Strelka mutations...")
-        strelka_data_processed = multi_process("process_saavs",
-                                               strelka_data_mut,
-                                               "variants",
-                                               config_yaml)
-
-        # keep proteins which are present in reference dataset if provided
-        if config_yaml["reference_dataset"] != "":
-            log.info("Filter UniProt IDs with reference dataset..")
-            strelka_data_processed = filter_id_with_reference(strelka_data_processed, config_yaml)
-
-        # filter sequences against reference proteome (if enabled)
-        if config_yaml["filter_seq_with_reference"]:
-            log.info("Filter variant sequences with reference proteome...")
-            if config_yaml["generate_subFASTA"] and config_yaml["reference_dataset"] != "":
-                log.info("Generate subFASTA proteome...")
-                fasta_proteome = subset_fasta_db(config_yaml["reference_proteome"],
-                                                 config_yaml["reference_dataset"])
-            else:
-                fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
-
-            # create temp folder
-            if not os.path.exists(os.path.join(output_path, "temp")):
-                os.mkdir(os.path.join(output_path, "temp"))
-
-            strelka_data_processed_h5 = multi_process("filter_seq_with_reference",
-                                                      strelka_data_processed,
-                                                      "sequences",
-                                                      fasta_proteome,
-                                                      output_path)
-
-            strelka_data_processed = pd.DataFrame()
-
-            for h5_path in strelka_data_processed_h5:
-                h5_path_key = os.path.splitext(os.path.basename(h5_path))[0]
-                strelka_data_processed_var_temp = pd.read_hdf(h5_path,
-                                                              h5_path_key)
-                strelka_data_processed = pd.concat([strelka_data_processed, strelka_data_processed_var_temp])
-        else:
-            fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
-
-        # add disease information (if enabled)
-        if config_yaml["add_disease_info"]:
-            strelka_data_processed_out = annotate_variant_info(strelka_data_processed,
-                                                              "ProteinID",
-                                                              config_yaml["annotation_data"],
-                                                              config_yaml["min_spec_pep_len"],
-                                                              config_yaml["max_spec_pep_len"]).to_csv(
-                os.path.join(output_path, "{}_disease_annotation_strelka.tsv".format(timestamp_str)),
-                sep="\t")
-
-        # map SAAVs to FASTA
-        strelka_data_processed_list = convert_df_to_bio_list(strelka_data_processed,
-                                                             "strelka",
-                                                             config_yaml["min_spec_pep_len"],
-                                                             config_yaml["max_spec_pep_len"],
-                                                             config_yaml["keep_saav_dups_in_fasta"])
-
-        # write to FASTA
-        log.info("Save annotated Strelka SAAVs as FASTA...")
-        write_fasta(strelka_data_processed_list, output_path, timestamp_str, "SAAV_sequences", "strelka")
-
-        fasta_proteome = read_fasta(config_yaml["reference_proteome"], "uniprot")
-        fasta_output = convert_df_to_bio_list(fasta_proteome, "uniprot")
-        fasta_combined_output = fasta_output + strelka_data_processed_list
-
-        if config_yaml["generate_subFASTA"]:
-            log.info("Save subFASTA proteome...")
-            write_fasta(fasta_output, output_path, timestamp_str, "subFASTA", "strelka")
-            write_fasta(fasta_combined_output, output_path, timestamp_str, "subFASTA_SAAV", "strelka")
-        else:
-            log.info("Save FASTA proteome...")
-            write_fasta(fasta_combined_output, output_path, timestamp_str, "FASTA_SAAV", "strelka")
-
-
-    end_time = time.time()
-    log.info("Runtime (total): {}min".format(str(round((end_time - start_time) / 60, 2))))
-
-    # remove temp folder
-    shutil.rmtree(os.path.join(output_path, "temp"), ignore_errors=True)
+    cfg = read_yaml(args.config_yaml)
+    out_dir = os.path.dirname(args.config_yaml)
+    global config_yaml
+    config_yaml = cfg
+
+    # iterate over all sources
+    for spec in SOURCE_SPECS:
+        if not cfg.get(spec.cfg_flag, False):
+            continue
+
+        log.info(f"Processing {spec.fasta_tag} input..")
+        df, join_key, seq_fmt, proc_mut_unit, proc_saavs_unit = spec.loader(cfg)
+        if df.empty:
+            log.warning(f"{spec.fasta_tag}: no entries – nothing written.")
+            continue
+        run_source_pipeline(df, join_key, seq_fmt, spec.fasta_tag, cfg, out_dir, ts, proc_mut_unit, proc_saavs_unit)
+
+    # tidy up and show total runtime
+    shutil.rmtree(os.path.join(out_dir, "temp"), ignore_errors=True)
+    mins = round((time.time() - start_time) / 60, 2)
+    log.info(f"runtime (total): {mins} min")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,4 +1,4 @@
-#v1.5
+#v2.0.0
 
 # General
 num_jobs: 16                                                                              # TSO500: 10, SAAVs: 24, COSMIC: 24
@@ -61,8 +61,10 @@ map_saav_list: False                                                            
 saav_list_path: ""                                                                        # path to SAAV list
 
 # Get Strelka VCF SAAVs
-# Note: variants depend on the NM_ sequence rather than the consensus sequence
-# which may result in inconsistencies between the variant positions and the consensus
-# sequence of the reference proteome
 map_strelka_vcf: False                                                                    # if set to True, SAAVs from the provided Strelka VCF file will be reported
 strelka_vcf_path: ""                                                                      # path to Strelka VCF file
+strelka_mutation_filter: True                                                             # if set to True, only NM_ sequences (NCBI) found in the reference proteome will be reported
+
+# Map ENST list
+map_enst: False                                                                            # if set to True, SAAVs from the provided ENST file will be reported
+enst_path: ""                                                                             # path to tsv with ENST IDs and mutations
