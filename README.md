@@ -17,7 +17,6 @@ ProteoGenDB offers users the option to filter peptide variants against a list of
 - pyarrow 11.0.0
 - Requests 2.25.1
 - PyYAML 6.0
-- BeautifulSoup4 4.11.2
 - colorlog 6.7.0
 - tqdm 4.64.1
 - pyvcf 0.6.8
@@ -34,7 +33,7 @@ cd ProteoGenDB
 2. Create a conda environment with the required packages:
 
 ```bash
-conda create -n ProteoGenDB -c conda-forge python=3.9 pandas=1.5.3 numpy=1.24.2 pytables=3.8.0 biopython=1.81 pyarrow=11.0.0 requests=2.25.1 PyYAML=6.0 beautifulsoup4=4.11.2 colorlog=6.7.0 tqdm=4.64.1 pyvcf=0.6.8
+conda create -n ProteoGenDB -c conda-forge python=3.9 pandas=1.5.3 numpy=1.24.2 pytables=3.8.0 biopython=1.81 pyarrow=11.0.0 requests=2.25.1 PyYAML=6.0 colorlog=6.7.0 tqdm=4.64.1 pyvcf=0.6.8
 ```
 
 3. Activate the conda environment:
