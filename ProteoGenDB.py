@@ -1514,13 +1514,15 @@ def load_enst(cfg: dict) -> Tuple[pd.DataFrame, str, str, str, str]:
 class SourceSpec:
     cfg_flag: str
     loader:   Callable[[dict], Tuple[pd.DataFrame, str, str, Optional[str], str]]
-    fasta_tag: str
+    description: str
+    tag: str
 
 
 def run_source_pipeline(src_df: pd.DataFrame,
                         join_key: str,
                         seq_fmt: str,
-                        fasta_tag: str,
+                        description: str,
+                        tag: str,
                         cfg: dict,
                         out_dir: str,
                         ts: str,
@@ -1528,7 +1530,7 @@ def run_source_pipeline(src_df: pd.DataFrame,
                         proc_saavs_unit: str) -> None:
 
     if src_df.empty:
-        log.warning(f"{fasta_tag}: no data – skipped.")
+        log.warning(f"{description}: no data – skipped.")
         return
 
     # keep only proteins present in reference dataset (if requested)
@@ -1590,7 +1592,7 @@ def run_source_pipeline(src_df: pd.DataFrame,
                                            cfg["min_spec_pep_len"],
                                            cfg["max_spec_pep_len"])
         src_df_out.to_csv(os.path.join(out_dir,
-                        f"{ts}_disease_annotation_{fasta_tag}.tsv"), sep="\t")
+                        f"{ts}_disease_annotation_{tag}.tsv"), sep="\t")
 
     # make fasta records
     recs = convert_df_to_bio_list(src_df, seq_fmt,
@@ -1599,35 +1601,35 @@ def run_source_pipeline(src_df: pd.DataFrame,
                                   cfg["keep_saav_dups_in_fasta"])
 
     # write variant fasta
-    log.info(f"Save {fasta_tag} peptides as FASTA..")
-    write_fasta(recs, out_dir, ts, "SAAV_sequences", fasta_tag)
+    log.info(f"Save {description} peptides as FASTA..")
+    write_fasta(recs, out_dir, ts, "SAAV_sequences", tag)
 
     # write combined (reference + variant) fasta
     prot_recs   = convert_df_to_bio_list(proteome, "uniprot")
     combined    = prot_recs + recs
     fasta_label = "subFASTA" if cfg["generate_subFASTA"] else "FASTA"
-    write_fasta(combined, out_dir, ts, f"{fasta_label}_SAAV", fasta_tag)
+    write_fasta(combined, out_dir, ts, f"{fasta_label}_SAAV", tag)
 
     # combined (reference + variant) FASTA only if a proteome is available
     if proteome_available and not proteome.empty:
         prot_recs = convert_df_to_bio_list(proteome, "uniprot")
         combined = prot_recs + recs
         fasta_label = "subFASTA" if cfg["generate_subFASTA"] else "FASTA"
-        write_fasta(combined, out_dir, ts, f"{fasta_label}_SAAV", fasta_tag)
+        write_fasta(combined, out_dir, ts, f"{fasta_label}_SAAV", tag)
 
         # optional standalone subproteome
         if cfg["generate_subFASTA"]:
-            write_fasta(prot_recs, out_dir, ts, "subFASTA", fasta_tag)
+            write_fasta(prot_recs, out_dir, ts, "subFASTA", tag)
 
 SOURCE_SPECS: List[SourceSpec] = [
-    SourceSpec("map_galaxy", load_galaxy, "Galaxy RNAseq mutations"),
-    SourceSpec("map_cosmic", load_cosmic, "COSMIC mutations"),
-    SourceSpec("map_tso", load_tso, "TSO500 mutations"),
-    SourceSpec("map_mfa", load_mfa, "MFA mutations"),
-    SourceSpec("map_strelka_vcf", load_strelka, "strelka mutations"),
-    SourceSpec("map_saav_list", load_saav_list, "SAAV list"),
-    SourceSpec("map_uniprot", load_uniprot,"UniProtID mutations"),
-    SourceSpec("map_enst", load_enst, "ENST mutations"),
+    SourceSpec("map_galaxy", load_galaxy, "Galaxy RNAseq mutations", "galaxy"),
+    SourceSpec("map_cosmic", load_cosmic, "COSMIC mutations", "cosmic"),
+    SourceSpec("map_tso", load_tso, "TSO500 mutations", "tso"),
+    SourceSpec("map_mfa", load_mfa, "MFA mutations", "mfa"),
+    SourceSpec("map_strelka_vcf", load_strelka, "strelka mutations", "strelka"),
+    SourceSpec("map_saav_list", load_saav_list, "SAAV list", "saav_list"),
+    SourceSpec("map_uniprot", load_uniprot,"UniProtID mutations",  "uniprot"),
+    SourceSpec("map_enst", load_enst, "ENST mutations", "enst"),
 ]
 
 
@@ -1655,12 +1657,12 @@ def main() -> None:
         if not cfg.get(spec.cfg_flag, False):
             continue
 
-        log.info(f"Processing {spec.fasta_tag} input..")
+        log.info(f"Processing {spec.description} input..")
         df, join_key, seq_fmt, proc_mut_unit, proc_saavs_unit = spec.loader(cfg)
         if df.empty:
-            log.warning(f"{spec.fasta_tag}: no entries – nothing written.")
+            log.warning(f"{spec.description}: no entries – nothing written.")
             continue
-        run_source_pipeline(df, join_key, seq_fmt, spec.fasta_tag, cfg, out_dir, ts, proc_mut_unit, proc_saavs_unit)
+        run_source_pipeline(df, join_key, seq_fmt, spec.description, spec.tag, cfg, out_dir, ts, proc_mut_unit, proc_saavs_unit)
 
     # tidy up and show total runtime
     shutil.rmtree(os.path.join(out_dir, "temp"), ignore_errors=True)
