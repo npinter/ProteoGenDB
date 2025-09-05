@@ -13,7 +13,8 @@ import logging
 import json
 import platform
 import vcf
-from pyarrow import feather
+import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple, Union, List, cast
 from requests.exceptions import ConnectionError
@@ -552,191 +553,153 @@ def fetch_fasta(pids, df_status, jid, p_bar_val, *args):
 
 def get_annotation_data(pids, df_status, jid, p_bar_val, *args):
     api_name = args[0][0]
-    api_url = args[0][1]
+    api_url  = args[0][1]
     annot_folder = args[0][2]
 
-    api_annot_path = str(os.path.join(annot_folder))
+    os.makedirs(annot_folder, exist_ok=True)
+    db_path = os.path.join(annot_folder, f"{api_name}_cache.sqlite")
 
-    # load Feather storage
-    feather_filename = "{}_data.feather".format(api_name)
-    feather_path = os.path.join(api_annot_path, feather_filename)
+    with closing(_sqlite_connect(db_path)) as con:
+        _sqlite_init(con)
 
-    feather_temp_filename = "{}_data_{}.temp.feather".format(api_name, jid)
-    feather_temp_path = os.path.join(api_annot_path, feather_temp_filename)
-
-    try:
-        data = pd.read_feather(feather_path, columns=["pid", "data"])
-    except FileNotFoundError:
-        data = pd.DataFrame(columns=["pid", "data"])
-        feather.write_feather(data, feather_path)
-
-    data_new = pd.DataFrame(columns=["pid", "data"])
-    result_data = []
-    feather_save = False
-    api_data = None
-
-    # get pid data from Feather or update it via API
-    for i_pid, pid in enumerate(pids):
-        if pid in data["pid"].values:
-            result = data[data['pid'] == pid]
-            result_data.append(result["data"].iloc[0])
-        else:
-            con_err = True
-            while con_err:
+        # Preload cache in chunks
+        cached: dict = {}
+        chunk = 900
+        for i in range(0, len(pids), chunk):
+            part = pids[i:i+chunk]
+            q = f"SELECT pid,data FROM cache WHERE pid IN ({','.join('?'*len(part))})"
+            for pid, data in con.execute(q, part).fetchall():
                 try:
-                    api_data = requests.get(api_url.format(pid=pid)).json()
-                    con_err = False
-                except ConnectionError:
-                    log.error("UniProt REST API issue.. retry..")
-                    sleep(1)
-            data_new = pd.concat([data_new, pd.DataFrame({'pid': [pid], 'data': [api_data]})], ignore_index=True)
-            result_data.append(api_data)
-            feather_save = True
+                    cached[pid] = json.loads(data)
+                except Exception:
+                    pass
 
-        p_bar_val[jid] = i_pid
+        now = int(time.time())
+        # Single pass over ALL pids to keep progress in sync
+        for i, pid in enumerate(pids):
+            if pid not in cached:
+                # fetch (retry on transient net issues)
+                while True:
+                    try:
+                        api_data = requests.get(api_url.format(pid=pid)).json()
+                        break
+                    except ConnectionError:
+                        log.error("UniProt REST API issue.. retry..")
+                        sleep(1)
+                # insert (tolerate brief locks)
+                for _ in range(8):
+                    try:
+                        con.execute(
+                            "INSERT OR IGNORE INTO cache(pid,data,ts) VALUES (?,?,?)",
+                            (pid, json.dumps(api_data), now)
+                        )
+                        break
+                    except sqlite3.OperationalError as e:
+                        if "locked" in str(e).lower():
+                            sleep(0.25)
+                            continue
+                        raise
+                cached[pid] = api_data
 
-    result_data_df = pd.Series(result_data)
+            p_bar_val[jid] = i  # <- advance for every pid
 
-    if feather_save:
-        feather.write_feather(data_new, feather_temp_path)
+        result_data = [cached.get(pid) for pid in pids]
 
-    df_status[jid] = result_data_df
+    df_status[jid] = pd.Series(result_data)
 
 
 def get_variant_info(pids, df_status, jid, p_bar_val, *args):
-    var_df = pd.DataFrame()
     cfg = args[0][0]
+    rows = []
 
-    for i_pid, pid in enumerate(pids):
-        variant_data = pid
+    for i, rec in enumerate(pids):
+        feats = (rec or {}).get("features") or []
 
-        if "features" in variant_data:
-            if variant_data["features"] is not None:
-                for variant in variant_data["features"]:
-                    if cfg["variant_reviewed_filter"]:
-                        if "clinicalSignificances" not in variant:
-                            continue
-                        if variant["clinicalSignificances"] is None:
-                            continue
-                        if not any(source in variant["clinicalSignificances"][0]["sources"] for source in cfg["variant_reviewed_filter"]):
-                            continue
-                    if cfg["variant_evidences_cutoff"] > 0:
-                        if "evidences" not in variant:
-                            continue
-                        if variant["evidences"] is None:
-                            continue
-                        if len(variant["evidences"]) < cfg["variant_evidences_cutoff"]:
-                            continue
-                    var_dict = {}
-                    if "ftId" in variant:
-                        var_dict["DL_ftID"] = variant["ftId"]
-                    else:
-                        var_dict["DL_ftID"] = None
-                    var_dict["DL_UniProtID"] = pid["accession"]
-                    if "cosmic curated" in str(variant["xrefs"]):
-                        for xref in variant["xrefs"]:
-                            if xref["name"] == "cosmic curated":
-                                var_dict["DL_CosmicID"] = xref["id"]
-                                break
-                    else:
-                        var_dict["DL_CosmicID"] = None
+        for v in feats:
+            # filters
+            if cfg["variant_reviewed_filter"]:
+                cs = v.get("clinicalSignificances") or []
+                if not cs or not any(s in (cs[0].get("sources") or []) for s in cfg["variant_reviewed_filter"]):
+                    continue
+            if cfg["variant_evidences_cutoff"] > 0:
+                ev = v.get("evidences") or []
+                if len(ev) < cfg["variant_evidences_cutoff"]:
+                    continue
 
-                    if "ClinVar" in str(variant["xrefs"]):
-                        for xref in variant["xrefs"]:
-                            if xref["name"] == "ClinVar":
-                                var_dict["DL_ClinVarID"] = xref["id"]
-                                break
-                    else:
-                        var_dict["DL_ClinVarID"] = None
+            begin = v.get("begin")
+            end   = v.get("end")
+            wild  = v.get("wildType", "?")
+            mut   = v.get("mutatedType")
 
-                    if "mutatedType" in variant:
-                        var_seq_mutatedtype = variant["mutatedType"]
-                    else:
-                        var_seq_mutatedtype = None
+            varpos_str = f"{wild}{begin}{mut}"
+            varpos     = [varpos_str] if begin == end else []
 
-                    var_dict["DL_VariantPosStr"] = "{}{}{}".format([variant["wildType"] if "wildType" in variant else "?"][0],
-                                                                   variant["begin"],
-                                                                   var_seq_mutatedtype)
+            # collect one row
+            row = {
+                "DL_UniProtID": rec.get("accession"),
+                "DL_ftID":      v.get("ftId"),
+                "DL_CosmicID":  next((x.get("id") for x in (v.get("xrefs") or []) if x.get("name")=="cosmic curated"), None),
+                "DL_ClinVarID": next((x.get("id") for x in (v.get("xrefs") or []) if x.get("name")=="ClinVar"), None),
+                "DL_VariantPosStr": varpos_str if varpos else "",
+                "DL_VariantPos":    varpos,
+                "DL_MAF": next((pf.get("frequency") for pf in (v.get("populationFrequencies") or []) if pf.get("populationName")=="MAF"), None),
+                "DL_sig_patho": np.nan, "DL_sig_likely_patho": np.nan,
+                "DL_sig_likely_benign": np.nan, "DL_sig_benign": np.nan,
+                "DL_sig_uncertain": np.nan, "DL_sig_conflict": np.nan,
+                "DL_disease_association": "1" if v.get("association") else "0",
+            }
 
-                    var_dict["DL_VariantPos"] = [var_dict["DL_VariantPosStr"]]
+            for cs in (v.get("clinicalSignificances") or []):
+                t, srcs = cs.get("type"), ";".join(cs.get("sources") or [])
+                if   t == "Likely pathogenic": row["DL_sig_likely_patho"] = srcs
+                elif t == "Pathogenic": row["DL_sig_patho"] = srcs
+                elif t == "Variant of uncertain significance": row["DL_sig_uncertain"] = srcs
+                elif t == "Benign": row["DL_sig_benign"] = srcs
+                elif t == "Likely benign": row["DL_sig_likely_benign"] = srcs
+                elif t == "Conflicting interpretations of pathogenicity": row["DL_sig_conflict"] = srcs
 
-                    if variant["begin"] != variant["end"]:
-                        var_dict["DL_VariantPosStr"] = ""
-                        var_dict["DL_VariantPos"] = []
+            rows.append(row)
 
-                    if "populationFrequencies" in variant:
-                        if not variant["populationFrequencies"] is None:
-                            for pf in variant["populationFrequencies"]:
-                                if pf["populationName"] == "MAF":
-                                    var_dict["DL_MAF"] = pf["frequency"]
-                                    break
-                    else:
-                        var_dict["DL_MAF"] = None
+        p_bar_val[jid] = i
 
-                    var_dict["DL_sig_patho"] = np.nan
-                    var_dict["DL_sig_likely_patho"] = np.nan
-                    var_dict["DL_sig_likely_benign"] = np.nan
-                    var_dict["DL_sig_benign"] = np.nan
-                    var_dict["DL_sig_uncertain"] = np.nan
-                    var_dict["DL_sig_conflict"] = np.nan
-
-                    if "clinicalSignificances" in variant:
-                        if not variant["clinicalSignificances"] is None:
-                            for cs in variant["clinicalSignificances"]:
-                                if cs["type"] == "Likely pathogenic":
-                                    var_dict["DL_sig_likely_patho"] = ";".join(cs["sources"])
-                                elif cs["type"] == "Pathogenic":
-                                    var_dict["DL_sig_patho"] = ";".join(cs["sources"])
-                                elif cs["type"] == "Variant of uncertain significance":
-                                    var_dict["DL_sig_uncertain"] = ";".join(cs["sources"])
-                                elif cs["type"] == "Benign":
-                                    var_dict["DL_sig_benign"] = ";".join(cs["sources"])
-                                elif cs["type"] == "Likely benign":
-                                    var_dict["DL_sig_likely_benign"] = ";".join(cs["sources"])
-                                elif cs["type"] == "Conflicting interpretations of pathogenicity":
-                                    var_dict["DL_sig_conflict"] = ";".join(cs["sources"])
-
-                    if "association" in variant:
-                        if not variant["association"] is None:
-                            var_dict["DL_disease_association"] = "1"
-                        else:
-                            var_dict["DL_disease_association"] = "0"
-                    else:
-                        var_dict["DL_disease_association"] = "0"
-
-                    var_df = pd.concat([var_df, pd.DataFrame(pd.Series(var_dict)).transpose()])
-
-                p_bar_val[jid] = i_pid
-
-    df_status[jid] = var_df
+    df_status[jid] = pd.DataFrame(rows, copy=False)
 
 
 def map_variant_info(dl_df, df_status, jid, p_bar_val, *args):
-    input_df = args[0][0]
-    min_pep_len = args[0][1]
-    max_pep_len = args[0][2]
+    input_df, min_len, max_len = args[0]
+    cols = input_df.columns.union(dl_df.columns)
+    out  = pd.DataFrame(columns=cols)
 
-    columns = input_df.columns.union(dl_df.columns)
-    input_df_temp = pd.DataFrame(columns=columns)
+    for i, (_, var) in enumerate(dl_df.iterrows()):
+        prot = input_df[input_df.UniProtID.eq(var.DL_UniProtID)]
+        hits = prot[prot.VariantPos.isin(var.DL_VariantPos)]
+        if len(hits) and hits.VarSeqCleave.values[0] is not None:
+            pep = hits.VarSeqCleave.values[0]
+            if min_len <= len(pep) <= max_len:
+                out = pd.concat([out,
+                                 pd.concat([hits.reset_index(drop=True).drop(["VarSeq"], axis=1, errors="ignore"),
+                                            pd.DataFrame(var).T.reset_index(drop=True)], axis=1)],
+                                ignore_index=True)
+        p_bar_val[jid] = i
+    df_status[jid] = out
 
-    for index, var in dl_df.iterrows():
-        prot_temp_df = input_df.loc[
-            (input_df.UniProtID.isin([var.DL_UniProtID]))]
-        var_temp_df = prot_temp_df.loc[(prot_temp_df.VariantPos.isin(var.DL_VariantPos))]
 
-        if len(var_temp_df) > 0 and var_temp_df.VarSeqCleave.values[0] is not None:
-            if min_pep_len <= len(var_temp_df.VarSeqCleave.values[0]) <= max_pep_len:
-                var_temp_df = pd.concat([var_temp_df.reset_index(drop=True).drop(
-                    ["VarSeq"], axis=1),
-                    pd.DataFrame(var).transpose().reset_index(drop=True)],
-                    axis=1
-                )
+def _sqlite_connect(db_path: str) -> sqlite3.Connection:
+    con = sqlite3.connect(db_path, timeout=30, isolation_level=None)  # autocommit
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    con.execute("PRAGMA temp_store=MEMORY")
+    con.execute("PRAGMA busy_timeout=5000")
+    return con
 
-                input_df_temp = pd.concat([input_df_temp, var_temp_df])
-
-        p_bar_val[jid] = index
-
-    df_status[jid] = input_df_temp
+def _sqlite_init(con: sqlite3.Connection) -> None:
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS cache (
+            pid TEXT PRIMARY KEY,
+            data TEXT NOT NULL,
+            ts   INTEGER NOT NULL
+        )
+    """)
 
 
 def annotate_variant_info(input_df, left_join, annot_data_path, min_pep_len, max_pep_len):
