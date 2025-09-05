@@ -1547,8 +1547,8 @@ def run_source_pipeline(src_df: pd.DataFrame,
         log.info("Filter UniProtIDs with reference dataset..")
         src_df = filter_id_with_reference(src_df, cfg)
 
-    # if no reference list yet user does *not* want orphan IDs, drop them
-    elif not cfg.get("filter_seq_with_reference_add_no_ids", True):
+    # if no reference list drop orphan IDs
+    elif not cfg["filter_seq_with_reference_add_no_ids"]:
         log.warning(
             "No reference dataset provided, but "
             "'filter_seq_with_reference_add_no_ids' is False – dropping NoUniID rows.")
