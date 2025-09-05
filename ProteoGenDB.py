@@ -852,11 +852,13 @@ def process_saavs(df, df_status, jid, p_bar_val, *args):
 
     df["VarSeq"] = None
     df["VarSeqCleave"] = None
+    df["RelPosMap"] = None
     var_seq_len = cfg["var_seq_length"]
 
     for pos in df.itertuples():
         var_seq_temp = {}
         var_seq_cleave_temp = {}
+        relpos_temp = {}
         if pos.Sequence is not None:
             for p in pos.VariantPos:
                 if not p[-1].isnumeric():
@@ -870,12 +872,29 @@ def process_saavs(df, df_status, jid, p_bar_val, *args):
                     post_x = ["#" * (2 * var_seq_len + 1 - (pos_end-pos_start))
                               if aa_pos + var_seq_len + 1 > seq_pos_last else ""][0]
                     var_seq_temp[p] = pre_x + pos.Sequence[pos_start:pos_end] + post_x
-                    var_seq_cleave_temp[p] = cleave_sequence(var_seq_temp[p], cfg)
+                    cleave_out = cleave_sequence(var_seq_temp[p], cfg)
+                    # cleave_out is (Seq, rel_idx) in SAAV mode (non-isoform)
+                    if isinstance(cleave_out, tuple):
+                        pep, rel_idx = cleave_out
+                    else:
+                        pep, rel_idx = cleave_out, None
+                    var_seq_cleave_temp[p] = pep
+                    # define RelPos:
+                    # stop "*": len(pep)+1
+                    # deletion "-": rel_idx
+                    # substitution: rel_idx
+                    if pep is not None:
+                        if p[-1] == "*":
+                            relpos_temp[p] = len(str(pep)) + 1
+                        else:
+                            relpos_temp[p] = rel_idx
             df["VarSeq"].loc[pos.Index] = [var_seq_temp]
             df["VarSeqCleave"].loc[pos.Index] = [var_seq_cleave_temp]
+            df["RelPosMap"].loc[pos.Index] = [relpos_temp]
         else:
             df["VarSeq"].loc[pos.Index] = [{}]
             df["VarSeqCleave"].loc[pos.Index] = [{}]
+            df["RelPosMap"].loc[pos.Index] = [{}]
 
         # update progress bar value process-wise
         p_bar_val[jid] = pos.Index
@@ -964,13 +983,14 @@ def cleave_sequence(var_dict, cfg, full_protein=False):
                 cleaved_peptides.append(Seq(enz_group))
         else:
             if enz_pos_low <= cfg["var_seq_length"] + 1 <= enz_pos_high:
-                # remove # from N- or C- terminal peptides
+                # compute relative index of the variant within this peptide
+                center = cfg["var_seq_length"] + 1
+                leading_hashes = len(enz_group) - len(enz_group.lstrip("#"))
                 if "#" in enz_group:
                     enz_group = enz_group.replace("#", "")
-
+                rel_idx = center - enz_pos_low + 1 - leading_hashes
                 enz_peptide = Seq(enz_group)
-
-                return enz_peptide
+                return (enz_peptide, rel_idx)
             else:
                 enz_peptide = None
         if not enz_spec:
@@ -1047,12 +1067,23 @@ def convert_df_to_bio_list(pd_seq, seq_format, min_pep_len=None, max_pep_len=Non
 
     if seq_format in ["galaxy", "cosmic", "tso", "strelka", "isoform", "mfa", "uniprot_mut", "saav_list"]:
         for i_var_pep, var_pep in pd_seq.VarSeqCleave.items():
-            var_counter = 1
             var_seq_last = None
             var_pos_last = None
 
             for var_pos, var_seq in var_pep[0].items():
                 if var_seq and min_pep_len <= len(var_seq) <= max_pep_len:
+                    # Prefer precomputed relative position (independent of full protein sequence)
+                    rel_pos = "NA"
+                    if "RelPosMap" in pd_seq.columns:
+                        try:
+                            rel_map = pd_seq.RelPosMap.loc[i_var_pep][0]
+                            if isinstance(rel_map, dict) and var_pos in rel_map and rel_map[var_pos] is not None:
+                                rel_pos = rel_map[var_pos]
+                        except Exception:
+                            pass
+                    # fallback for stop codons if precomputed map not present
+                    if rel_pos == "NA" and var_pos[-1] == "*":
+                        rel_pos = len(str(var_seq)) + 1
                     if var_seq == var_seq_last:
                         # this concatenates variants with the same peptide
                         # drop last element of list
@@ -1060,28 +1091,27 @@ def convert_df_to_bio_list(pd_seq, seq_format, min_pep_len=None, max_pep_len=Non
                         seq_dups.pop()
                         # append variant position to last one
                         var_pos = "_".join((var_pos_last, var_pos))
-                        var_counter -= 1
                     if seq_format == "galaxy":
-                        # FASTA header: sp|UniProtID_VariantPos|ENSEMBLID
-                        var_header = "sp|{}_{}_{}|{}".format(
+                        # FASTA header: sp|UniProtID_VariantPos~RelPos|ENSEMBLID
+                        var_header = "sp|{}_{}~{}|{}".format(
                             pd_seq.UniProtID.loc[i_var_pep],
                             var_pos,
-                            var_counter,
+                            rel_pos,
                             pd_seq.ProteinID.loc[i_var_pep].split("_")[0])
                     elif seq_format == "cosmic":
-                        # FASTA header: sp|UniProtID_ProteinID_VariantPos|COSMICID
-                        var_header = "sp|{}_{}_{}_{}|{}".format(
+                        # FASTA header: sp|UniProtID_ProteinID_VariantPos~RelPos|COSMICID
+                        var_header = "sp|{}_{}_{}~{}|{}".format(
                             pd_seq.UniProtID.loc[i_var_pep],
                             pd_seq.ProteinID.loc[i_var_pep],
                             var_pos,
-                            var_counter,
+                            rel_pos,
                             "{}".format(pd_seq.CosmicID.loc[i_var_pep]))
                     elif seq_format in ["tso", "strelka"]:
-                        # FASTA header: sp|UniProtID_VariantPos|RefSeq_Protein
-                        var_header = "sp|{}_{}_{}|{}".format(
+                        # FASTA header: sp|UniProtID_VariantPos~RelPos|RefSeq_Protein
+                        var_header = "sp|{}_{}~{}|{}".format(
                             pd_seq.UniProtID.loc[i_var_pep],
                             var_pos,
-                            var_counter,
+                            rel_pos,
                             pd_seq.ProteinID.loc[i_var_pep])
                     elif seq_format == "isoform":
                         # FASTA header: sp|UniProtID_PepID|RefSeq_Protein
@@ -1090,23 +1120,23 @@ def convert_df_to_bio_list(pd_seq, seq_format, min_pep_len=None, max_pep_len=Non
                             var_pos,
                             [f"|{pd_seq.Consensus.loc[i_var_pep]}" if "Consensus" in pd_seq.columns else ""][0])
                     elif seq_format == "mfa":
-                        # FASTA header: sp|UniProtID_VariantPos|RefSeq_GeneID
-                        var_header = "sp|{}_{}_{}|{}".format(
+                        # FASTA header: sp|UniProtID_VariantPos~RelPos|RefSeq_GeneID
+                        var_header = "sp|{}_{}~{}|{}".format(
                             pd_seq.UniProtID.loc[i_var_pep],
                             var_pos,
-                            var_counter,
+                            rel_pos,
                             pd_seq.GeneID.loc[i_var_pep])
                     elif seq_format in ["uniprot_mut", "saav_list"]:
+                        # FASTA header: sp|UniProtID_VariantPos~RelPos|VariantID
                         variant_id = pd_seq.VariantID.loc[i_var_pep] if 'VariantID' in pd_seq.columns else var_pos
-                        var_header = "sp|{}_{}_{}|{}".format(
+                        var_header = "sp|{}_{}~{}|{}".format(
                             pd_seq.UniProtID.loc[i_var_pep],
                             var_pos,
-                            var_counter,
+                            rel_pos,
                             variant_id)
                     record = SeqRecord(var_seq, var_header, '', '')
                     seq_records.append(record)
                     seq_dups.append(str(var_seq))
-                    var_counter += 1
                     var_seq_last = var_seq
                     var_pos_last = var_pos
 
@@ -1198,30 +1228,6 @@ def filter_to_consensus(df, proteome, seq_col="Sequence", id_col="UniProtID"):
         keep_mask.append(False)
 
     return df.loc[keep_mask].reset_index(drop=True)
-
-
-def mark_mutated_residues(df, seq_col="Sequence", var_col="VariantPos"):
-    for i, row in df.iterrows():
-        seq: Union[str, Seq, None] = row[seq_col]
-        if not seq or pd.isna(seq):
-            continue
-        seq_str = str(seq)
-
-        for var in row[var_col]:
-            # only simple substitutions get a lower-case mark
-            if var[-1].isalpha(): # skip "*" or "-"
-                pos = int(var[1:-1]) - 1
-                if pos >= len(seq_str):
-                    continue
-                # reference AA matches sequence
-                if seq_str[pos].upper() == var[-1]:
-                    seq_str = (
-                        seq_str[:pos]
-                        + seq_str[pos].lower()
-                        + seq_str[pos + 1 :])
-        # store back as the same type that came in
-        df.at[i, seq_col] = Seq(seq_str) if isinstance(seq, Seq) else seq_str
-    return df
 
 
 def load_galaxy(cfg: dict) -> Tuple[pd.DataFrame, str, str, None, str]:
@@ -1554,10 +1560,6 @@ def run_source_pipeline(src_df: pd.DataFrame,
                                proc_mut_unit,
                                cfg)
 
-    # mark mutated residues in SAAV sequences
-    log.info("Mark mutated residues in sequences..")
-    src_df = mark_mutated_residues(src_df)
-
     # process SAAVs
     log.info("Processing mutations..")
     src_df = multi_process("process_saavs",
@@ -1603,12 +1605,6 @@ def run_source_pipeline(src_df: pd.DataFrame,
     # write variant fasta
     log.info(f"Save {description} peptides as FASTA..")
     write_fasta(recs, out_dir, ts, "SAAV_sequences", tag)
-
-    # write combined (reference + variant) fasta
-    prot_recs   = convert_df_to_bio_list(proteome, "uniprot")
-    combined    = prot_recs + recs
-    fasta_label = "subFASTA" if cfg["generate_subFASTA"] else "FASTA"
-    write_fasta(combined, out_dir, ts, f"{fasta_label}_SAAV", tag)
 
     # combined (reference + variant) FASTA only if a proteome is available
     if proteome_available and not proteome.empty:
