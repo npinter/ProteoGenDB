@@ -742,61 +742,39 @@ def map_variant_info(dl_df, df_status, jid, p_bar_val, *args):
 def annotate_variant_info(input_df, left_join, annot_data_path, min_pep_len, max_pep_len):
     log.info(f"Collect disease information for {left_join}s..")
 
-    # drop Sequence (probably lowers RAM usage)
-    input_df.drop(["Sequence"], axis=1, inplace=True)
+    df = input_df.copy()
 
-    input_df = input_df.explode('VariantPos')
+    # lighten memory
+    df.drop(["Sequence"], axis=1, inplace=True, errors="ignore")
 
-    def get_var_seq_cleave(row):
+    # one row per variant
+    df = df.explode('VariantPos')
+
+    # map each VariantPos -> peptide string
+    def _pep_at_pos(row):
         pos = row['VariantPos']
-        cleave_dict = row['VarSeqCleave'][0]
-        return cleave_dict.get(pos, '')
+        m = row['VarSeqCleave'][0] if isinstance(row['VarSeqCleave'], list) else row['VarSeqCleave']
+        if isinstance(m, dict):
+            return m.get(pos, '')
+        return ''
 
-    # apply function to each row
-    input_df['VarSeq'] = input_df.apply(get_var_seq_cleave, axis=1)
-    input_df['VarSeqCleave'] = input_df.apply(get_var_seq_cleave, axis=1)
+    df['VarSeq'] = df.apply(_pep_at_pos, axis=1)
+    df['VarSeqCleave'] = df['VarSeq']
+    df.drop_duplicates(subset=["UniProtID", "VariantPos", "VarSeqCleave"], keep="first", inplace=True)
 
-    # drop duplicates
-    input_df.drop_duplicates(subset=["UniProtID", "VariantPos", "VarSeqCleave"], keep="first", inplace=True)
+    # context columns to preserve if present
+    ctx_cols = [c for c in ["GeneID", "ProteinID", "RelPosMap"] if c in df.columns]
 
-    # load Feather storage
-    feather_filename = "{}_data.feather".format("ebi")
-    feather_path = os.path.join(annot_data_path, feather_filename)
-
-    # create annotation folder
-    if not os.path.exists(annot_data_path):
-        os.mkdir(annot_data_path)
-
-    try:
-        feather_data = pd.read_feather(feather_path)
-    except FileNotFoundError:
-        feather_data = pd.DataFrame(columns=["pid", "data"])
-        feather.write_feather(feather_data, feather_path)
+    # base set = all SAAV peptides that would go to FASTA
+    mask = df['VarSeqCleave'].apply(lambda s: bool(s) and min_pep_len <= len(str(s)) <= max_pep_len)
+    base_df = df.loc[mask, ["UniProtID", "VariantPos", "VarSeqCleave", "VarSeq"] + ctx_cols].reset_index(drop=True)
 
     annotate_data = multi_process("get_annotation_data",
-                                  input_df.UniProtID.drop_duplicates().to_list(),
+                                  df.UniProtID.drop_duplicates().to_list(),
                                   left_join,
                                   "ebi",
                                   "https://www.ebi.ac.uk/proteins/api/variation/{pid}",
                                   annot_data_path)
-
-    # concatenate requested variant data and combine with Feather database
-    temp_feather_files = []
-
-    for file_name in os.listdir(annot_data_path):
-        if file_name.endswith(".temp.feather"):
-            temp_feather_files.append(os.path.join(annot_data_path, file_name))
-
-    # save new annotations to Feather database
-    if len(temp_feather_files) > 0:
-        temp_feather_dfs = pd.DataFrame()
-        for temp_feather_file in temp_feather_files:
-            temp_feather_dfs = pd.concat([temp_feather_dfs, pd.read_feather(temp_feather_file)])
-            os.remove(temp_feather_file)
-
-        feather_data = pd.concat([feather_data, temp_feather_dfs])
-
-        feather.write_feather(feather_data, feather_path)
 
     log.info(f"Extract variant information for {left_join}s..")
     disease_lookup_df = multi_process("get_variant_info",
@@ -808,25 +786,50 @@ def annotate_variant_info(input_df, left_join, annot_data_path, min_pep_len, max
     disease_lookup_df = disease_lookup_df.drop_duplicates(
         subset=["DL_UniProtID", "DL_VariantPosStr"])
 
-    log.info(f"Map variant information..")
-    input_df = multi_process("map_variant_info",
-                             disease_lookup_df,
-                             "Variants",
-                             input_df,
-                             min_pep_len,
-                             max_pep_len)
+    log.info("Map variant information..")
+    # rows that do have UniProt-annotated variants and pass peptide-length filter
+    ann_df = multi_process("map_variant_info",
+                           disease_lookup_df,
+                           "Variants",
+                           df,
+                           min_pep_len,
+                           max_pep_len)
 
-    # keep only columns for FASTA header
-    input_df_drop_list = ["DL_UniProtID", "DL_CosmicID", "DL_VariantPos", "DL_VariantPosStr"]
-    input_df.drop(input_df_drop_list, axis=1, inplace=True)
+    # keep only columns for FASTA header + disease fields
+    drop_cols = ["DL_UniProtID", "DL_CosmicID", "DL_VariantPos", "DL_VariantPosStr"]
+    ann_df.drop([c for c in drop_cols if c in ann_df.columns], axis=1, inplace=True)
+    ann_df.rename(columns=lambda x: x.replace("DL_", ""), inplace=True)
 
-    # replace nan with NA
-    input_df.replace({np.nan: "NA"}, inplace=True)
+    # mark annotated
+    if not ann_df.empty:
+        ann_df["Annotated"] = True
 
-    # rename columns
-    input_df.rename(columns=lambda x: x.replace("DL_", ""), inplace=True)
+    # add unannotated SAAVs with NA fields
+    key_cols = ["UniProtID", "VariantPos", "VarSeqCleave"]
+    have = ann_df[key_cols].drop_duplicates() if not ann_df.empty else pd.DataFrame(columns=key_cols)
+    missing = base_df.merge(have, on=key_cols, how="left", indicator=True)
+    missing = missing[missing["_merge"] == "left_only"].drop(columns="_merge")
 
-    return input_df
+    # ensure same columns -> NA-fill disease fields
+    if ann_df.empty:
+        # define disease columns when nothing was annotated
+        disease_cols = ["ftID", "ClinVarID", "MAF",
+                        "sig_patho", "sig_likely_patho", "sig_likely_benign",
+                        "sig_benign", "sig_uncertain", "sig_conflict",
+                        "disease_association"]
+        ann_df = pd.DataFrame(columns=key_cols + ["VarSeq"] + ctx_cols + disease_cols + ["Annotated"])
+
+    for c in ann_df.columns:
+        if c not in missing.columns:
+            missing[c] = "NA"
+    missing["Annotated"] = False
+
+    # combine and final NA normalization
+    out_df = pd.concat([ann_df, missing[ann_df.columns]], ignore_index=True)
+    obj_cols = [c for c in out_df.columns if out_df[c].dtype == object and c != "Annotated"]
+    out_df[obj_cols] = out_df[obj_cols].replace({np.nan: "NA"})
+
+    return out_df
 
 
 def process_uniprot_ids(ids, df_status, jid, p_bar_val, *args):
