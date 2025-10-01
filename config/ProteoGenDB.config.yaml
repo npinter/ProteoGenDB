@@ -60,5 +60,9 @@ strelka_vcf_path: ""                                                            
 strelka_mutation_filter: True                                                             # if set to True, only NM_ sequences (NCBI) found in the reference proteome will be reported
 
 # Map ENST list
-map_enst: False                                                                            # if set to True, SAAVs from the provided ENST file will be reported
+map_enst: False                                                                           # if set to True, SAAVs from the provided ENST file will be reported
 enst_path: ""                                                                             # path to tsv with ENST IDs and mutations
+
+# map Illumina connected annotations JSON
+map_illumina_json: False                                                                  # if set to True, SAAVs from the provided Illumina JSON file will be reported
+illumina_json_path: ""                                                                    # path to annotator JSON

@@ -58,7 +58,7 @@ def print_welcome():
  |_|   |_|  \___/ \__\___|\___/ \_____|\___|_| |_|_____/|____/                              
 """)
     log.info(" Niko Pinter - https://github.com/npinter/ProteoGenDB")
-    log.info(" v2.1.0 \n")
+    log.info(" v2.2.0 \n")
 
 
 def multi_process(func, input_df, unit, *args):
@@ -185,7 +185,6 @@ def read_fasta(fasta_file, database):
             fasta_df_temp["Description"] = desc
         elif database == "galaxy":
             pids = []
-            gids = []
             gname = []
             for seq_record in SeqIO.parse(fasta, "fasta"):
                 header_split = seq_record.description.split("|")
@@ -871,33 +870,6 @@ def process_saavs(df, df_status, jid, p_bar_val, *args):
     df_status[jid] = df
 
 
-def process_isoforms(df, df_status, jid, p_bar_val, *args):
-    cfg = args[0][0]
-
-    iso_seq_cleave_temp = {}
-
-    for iso in df.itertuples():
-        # cleave isoform
-        iso_seq_cleave_temp[iso.Identifier] = cleave_sequence(iso.Sequence, cfg, full_protein=True)
-
-        # update progress bar value process-wise
-        p_bar_val[jid] = iso.Index
-
-    # transform into dataframe
-    df_new = pd.Series(iso_seq_cleave_temp).to_frame().reset_index()
-    df_new.columns = ["UniProtID", "VarSeqCleave"]
-
-    if cfg["drop_unmapped_isoforms"]:
-        df_new = pd.merge(df_new, df[['Identifier', 'Consensus']],
-                          left_on='UniProtID',
-                          right_on='Identifier',
-                          how='left')
-
-        df_new = df_new.drop('Identifier', axis=1)
-
-    df_status[jid] = df_new
-
-
 def process_mutation(df, df_status, jid, p_bar_val, *args):
 
     df["SequenceMut"] = None
@@ -1482,6 +1454,86 @@ def load_enst(cfg: dict) -> Tuple[pd.DataFrame, str, str, str, str]:
     return df, "UniProtID", "uniprot_mut", "ENST mutations", "variants"
 
 
+def load_illumina_json(cfg: dict) -> Tuple[pd.DataFrame, str, str, str, str]:
+    path = cfg.get("illumina_json_path", "")
+    if not path or not os.path.exists(path):
+        return pd.DataFrame(), "", "", "", ""
+
+    with open(path, "r") as fh:
+        root = json.load(fh)
+
+    positions = root.get("positions")
+    if positions is None:
+        # file may be an array already
+        positions = root if isinstance(root, list) else []
+
+    rows = []
+    for pos in positions:
+        if pos.get("filters") != ["PASS"]:
+            continue
+        for var in pos.get("variants", []):
+            vid = var.get("vid", "")
+            for tx in var.get("transcripts", []):
+                cons = tx.get("consequence") or []
+                if "missense_variant" not in cons:
+                    continue
+                hgvsp = tx.get("hgvsp") or ""
+                # expect "...:p.(Thr521Ala)"
+                m = re.search(r":p\.\(([^)]+)\)", hgvsp)
+                if not m:
+                    continue
+                aa3 = m.group(1)  # e.g. Thr521Ala
+                prot = tx.get("proteinId") or hgvsp.split(":", 1)[0]
+                if not prot:
+                    continue
+                rows.append({"ProteinID": prot, "VariantPos3": aa3, "VariantID": vid})
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(), "", "", "", ""
+
+    aa_dict = {
+        'Cys': 'C', 'Asp': 'D', 'Ser': 'S', 'Gln': 'Q', 'Lys': 'K',
+        'Ile': 'I', 'Pro': 'P', 'Thr': 'T', 'Phe': 'F', 'Asn': 'N',
+        'Gly': 'G', 'His': 'H', 'Leu': 'L', 'Arg': 'R', 'Trp': 'W',
+        'Ala': 'A', 'Val': 'V', 'Glu': 'E', 'Tyr': 'Y', 'Met': 'M',
+        'Ter': '*', 'del': '-'
+    }
+    aa_regex = "|".join(aa_dict.keys())
+
+    df["VariantPos"] = (
+        df["VariantPos3"]
+        .str.replace(aa_regex, lambda x: aa_dict[x.group()], regex=True)
+        .apply(lambda s: [s])
+    )
+
+    # map ProteinID -> UniProtID
+    ensp_ids = df[df.ProteinID.str.startswith("ENSP", na=False)]["ProteinID"].drop_duplicates().tolist()
+
+    maps = []
+    if ensp_ids:
+        maps.append(
+            get_uniprot_id(ensp_ids, fmt_from="Ensembl_Protein", ens_sub=False)
+            .rename(columns={"FromID":"ProteinID","ToID":"UniProtID"})
+        )
+    uni = pd.concat(maps, ignore_index=True) if maps else pd.DataFrame(columns=["ProteinID","UniProtID"])
+    df = df.merge(uni, on="ProteinID", how="left")
+    df["UniProtID"] = df["UniProtID"].fillna("NoUniID")
+
+    # fetch sequences for UniProt IDs
+    ids  = df.loc[df.UniProtID != "NoUniID", "UniProtID"].drop_duplicates().tolist()
+    if ids:
+        seqs = multi_process("fetch_fasta", ids, "ids", "uniprot")
+        df = df.merge(pd.DataFrame(list(zip(ids, seqs)), columns=["UniProtID","Sequence"]),
+                      on="UniProtID", how="left")
+
+    # keep only rows with sequence
+    df = df.dropna(subset=["Sequence"])
+
+    df = df[["UniProtID", "ProteinID", "VariantID", "VariantPos", "VariantPos3", "Sequence"]]
+
+    return df, "UniProtID", "uniprot_mut", "Illumina mutations", "variants"
+
 @dataclass
 class SourceSpec:
     cfg_flag: str
@@ -1535,7 +1587,7 @@ def run_source_pipeline(src_df: pd.DataFrame,
 
     # filter against the reference proteome
     proteome_available = bool(cfg.get("reference_proteome"))
-    proteome           = pd.DataFrame()
+    proteome = pd.DataFrame()
 
     # filter peptide sequences against reference proteome (if requested)
     if cfg["filter_seq_with_reference"]:
@@ -1592,6 +1644,7 @@ SOURCE_SPECS: List[SourceSpec] = [
     SourceSpec("map_saav_list", load_saav_list, "SAAV list", "saav_list"),
     SourceSpec("map_uniprot", load_uniprot,"UniProtID mutations",  "uniprot"),
     SourceSpec("map_enst", load_enst, "ENST mutations", "enst"),
+    SourceSpec("map_illumina_json", load_illumina_json, "Illumina Connected Annotations", "illumina_json"),
 ]
 
 
