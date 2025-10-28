@@ -3,6 +3,7 @@ import io
 import re
 import shutil
 import time
+import gzip
 import yaml
 import warnings
 import pandas as pd
@@ -1459,8 +1460,15 @@ def load_illumina_json(cfg: dict) -> Tuple[pd.DataFrame, str, str, str, str]:
     if not path or not os.path.exists(path):
         return pd.DataFrame(), "", "", "", ""
 
-    with open(path, "r") as fh:
-        root = json.load(fh)
+    # if gzipped extract in memory (check file type --> read first few bytes)
+    root = {}
+    file_start = open(path, "rb").read(3)
+    if file_start == b'\x1f\x8b\x08':
+        with gzip.open(path, "rt") as fh:
+            root = json.load(fh)
+    else:
+        with open(path, "r") as fh:
+            root = json.load(fh)
 
     positions = root.get("positions")
     if positions is None:
