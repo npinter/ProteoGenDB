@@ -1486,6 +1486,7 @@ def load_illumina_json(cfg: dict) -> Tuple[pd.DataFrame, str, str, str, str]:
                 if "missense_variant" not in cons:
                     continue
                 hgvsp = tx.get("hgvsp") or ""
+                hgnc = tx.get("hgnc") or ""
                 # expect "...:p.(Thr521Ala)"
                 m = re.search(r":p\.\(([^)]+)\)", hgvsp)
                 if not m:
@@ -1494,7 +1495,7 @@ def load_illumina_json(cfg: dict) -> Tuple[pd.DataFrame, str, str, str, str]:
                 prot = tx.get("proteinId") or hgvsp.split(":", 1)[0]
                 if not prot:
                     continue
-                rows.append({"ProteinID": prot, "VariantPos3": aa3, "VariantID": vid})
+                rows.append({"ProteinID": prot, "VariantPos3": aa3, "VariantID": vid, "Gene": hgnc})
 
     df = pd.DataFrame(rows)
     if df.empty:
@@ -1538,7 +1539,7 @@ def load_illumina_json(cfg: dict) -> Tuple[pd.DataFrame, str, str, str, str]:
     # keep only rows with sequence
     df = df.dropna(subset=["Sequence"])
 
-    df = df[["UniProtID", "ProteinID", "VariantID", "VariantPos", "VariantPos3", "Sequence"]]
+    df = df[["UniProtID", "ProteinID", "VariantID", "Gene", "VariantPos", "VariantPos3", "Sequence"]]
 
     return df, "UniProtID", "uniprot_mut", "Illumina mutations", "variants"
 
