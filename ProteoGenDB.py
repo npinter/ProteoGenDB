@@ -1543,6 +1543,172 @@ def load_illumina_json(cfg: dict) -> Tuple[pd.DataFrame, str, str, str, str]:
 
     return df, "UniProtID", "uniprot_mut", "Illumina mutations", "variants"
 
+
+def load_vep_json(cfg: dict) -> Tuple[pd.DataFrame, str, str, str, str]:
+    path = cfg.get("vep_json_path", "")
+    if not path or not os.path.exists(path):
+        return pd.DataFrame(), "", "", "", ""
+
+    # load JSONL (NDJSON)
+    root: List[dict] = []
+    try:
+        with open(path, "rb") as fh:
+            magic = fh.read(3)
+        is_gz = (magic == b"\x1f\x8b\x08")
+        opener = (lambda p: gzip.open(p, "rt")) if is_gz else (lambda p: open(p, "rt"))
+
+        with opener(path) as fh:
+            for i, ln in enumerate(fh, 1):
+                s = (ln or "").strip()
+                if not s:
+                    continue
+                if s in ("[", "]", ","):
+                    log.error(f"VEP JSONL reader: invalid token on line {i} ('{s}'). Only JSONL objects are supported.")
+                    return pd.DataFrame(), "", "", "", ""
+                if s.endswith(","):
+                    s = s[:-1].strip()
+                try:
+                    obj = json.loads(s)
+                except json.JSONDecodeError as e:
+                    log.error(f"VEP JSONL reader: JSON error on line {i}: {e}")
+                    return pd.DataFrame(), "", "", "", ""
+                if not isinstance(obj, dict):
+                    log.error(f"VEP JSONL reader: line {i} is not a JSON object. Only JSONL objects are supported.")
+                    return pd.DataFrame(), "", "", "", ""
+                root.append(obj)
+    except Exception as e:
+        log.error(f"Could not read VEP JSONL file: {e}")
+        return pd.DataFrame(), "", "", "", ""
+
+    if not root:
+        return pd.DataFrame(), "", "", "", ""
+
+    allowed_terms = {"missense_variant", "inframe_deletion", "inframe_insertion"}
+
+    def _pass_filter(inp: str) -> bool:
+        if not inp or "\t" not in inp:
+            return True
+        parts = inp.split("\t")
+        # from VCF: CHROM POS ID REF ALT QUAL FILTER INFO  -> FILTER idx=6
+        return len(parts) >= 7 and parts[6] == "PASS"
+
+    def _pick_transcript(tcs: List[dict]) -> Optional[dict]:
+        # prefer MANE Select with hgvsp
+        # else first protein_coding with hgvsp
+        # else first with hgvsp
+        if not tcs:
+            return None
+        # pre-filter by consequence + hgvsp presence
+        cand = [t for t in tcs
+                if set(t.get("consequence_terms") or []).intersection(allowed_terms)
+                and t.get("hgvsp")]
+        if not cand:
+            return None
+        for t in cand:
+            # MANE can come as "mane_select" (string) or "mane" (list)
+            mane_sel = t.get("mane_select", "")
+            mane_list = t.get("mane") or []
+            if isinstance(mane_list, list) and "MANE_Select" in mane_list:
+                return t
+            if isinstance(mane_sel, str) and mane_sel:
+                return t
+        for t in cand:
+            if t.get("biotype") == "protein_coding":
+                return t
+        return cand[0]
+
+    def _hgvsp_to_parts(hgvsp: str) -> Tuple[Optional[str], Optional[str]]:
+        #  split 'NP_001165882.1:p.Ala319_Thr320del' -> (ProteinID, 'Ala319_Thr320del')
+        if not hgvsp or ":" not in hgvsp:
+            return None, None
+        prot, tail = hgvsp.split(":", 1)
+        m = re.search(r"p\.\(?([A-Za-z]{3}(?:_[A-Za-z]{3}\d+)?\d+(?:[A-Za-z]{3}|Ter|del|dup))\)?", tail)
+        return prot, m.group(1) if m else None
+
+    aa_dict = {
+        'Cys': 'C', 'Asp': 'D', 'Ser': 'S', 'Gln': 'Q', 'Lys': 'K',
+        'Ile': 'I', 'Pro': 'P', 'Thr': 'T', 'Phe': 'F', 'Asn': 'N',
+        'Gly': 'G', 'His': 'H', 'Leu': 'L', 'Arg': 'R', 'Trp': 'W',
+        'Ala': 'A', 'Val': 'V', 'Glu': 'E', 'Tyr': 'Y', 'Met': 'M',
+        'Ter': '*', 'del': '-'
+    }
+    aa_regex = "|".join(aa_dict.keys())
+
+    rows: List[dict] = []
+    for rec in root:
+        try:
+            if not _pass_filter(rec.get("input", "")):
+                continue
+            if rec.get("most_severe_consequence") not in allowed_terms:
+                continue
+
+            tx = _pick_transcript(rec.get("transcript_consequences") or [])
+            if not tx:
+                continue
+
+            prot_id, pos3 = _hgvsp_to_parts(tx.get("hgvsp", ""))
+            if not prot_id or not pos3:
+                continue
+
+            # drop complex/range HGVS
+            low = pos3.lower()
+            if "_" in pos3 or "delins" in low or "fs" in low:
+                continue
+            # insertions/duplications are currently not supported by process_mutation/process_saavs
+            if "dup" in low:
+                continue
+
+            # convert three-letter AA codes -> one-letter
+            pos1 = re.sub(aa_regex, lambda m: aa_dict[m.group(0)], pos3)
+
+            # build one row
+            rows.append({
+                "ProteinID": prot_id,
+                "VariantPos3": pos3,
+                "VariantPos": [pos1],
+                "GeneID": tx.get("gene_symbol") or tx.get("gene_id") or "NA"
+            })
+        except Exception:
+            continue
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(), "", "", "", ""
+
+    # map to UniProt
+    p_np_xp = df[df["ProteinID"].str.startswith(("NP_", "XP_"), na=False)]["ProteinID"].drop_duplicates().tolist()
+
+    # map RefSeq NP_/XP_ -> UniProt
+    uniprot_lookup = get_uniprot_id(p_np_xp,
+                                    fmt_from="RefSeq_Protein",
+                                    split_str=",").rename(columns={"FromID": "ProteinID",
+                                                                   "ToID": "UniProtID"})
+
+    df["UniProtID"] = multi_process("process_uniprot_ids",
+                                    df["ProteinID"].tolist(),
+                                    "ids",
+                                    uniprot_lookup)
+    df["UniProtID"] = df["UniProtID"].fillna("NoUniID")
+
+    # fetch sequences
+    np_xp_ids = df[df["ProteinID"].str.startswith(("NP_", "XP_"), na=False)]["ProteinID"].drop_duplicates().tolist()
+
+    log.info("Fetching NCBI protein sequences for VEP variants..")
+    seqs = multi_process("fetch_fasta",
+                         np_xp_ids,
+                         "ids",
+                         "ncbi")
+    df = df.merge(pd.DataFrame(list(zip(np_xp_ids, seqs)), columns=["ProteinID", "Sequence"]), on="ProteinID", how="left")
+
+    # keep only rows that have a sequence
+    df = df.dropna(subset=["Sequence"])
+
+    # final column order
+    df = df[["UniProtID", "ProteinID", "GeneID", "VariantPos", "VariantPos3", "Sequence"]]
+
+    return df, "UniProtID", "uniprot_mut", "VEP mutation", "variants"
+
+
 @dataclass
 class SourceSpec:
     cfg_flag: str
