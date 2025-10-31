@@ -18,7 +18,9 @@ import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple, Union, List, cast
+from requests.adapters import HTTPAdapter
 from requests.exceptions import ConnectionError
+from urllib3.util.retry import Retry
 from argparse import ArgumentParser
 from datetime import datetime
 from colorlog import ColoredFormatter
@@ -477,75 +479,164 @@ def get_uniprot_id(ids, fmt_from="Ensembl_Protein", fmt_to="UniProtKB", ens_sub=
 
 
 def fetch_fasta(pids, df_status, jid, p_bar_val, *args):
+    try:
+        # urllib3 >=1.26
+        retry_kwargs = {"allowed_methods": frozenset(["GET"])}
+    except Exception:
+        # fallback for older urllib3
+        retry_kwargs = {"method_whitelist": frozenset(["GET"])}
+    import random
+
+    def _make_session():
+        sess = requests.Session()
+        r = Retry(
+            total=5, connect=5, read=5,
+            backoff_factor=0.8,
+            status_forcelist=[429, 500, 502, 503, 504],
+            **retry_kwargs
+        )
+        ad = HTTPAdapter(max_retries=r, pool_connections=16, pool_maxsize=16)
+        sess.mount("https://", ad); sess.mount("http://", ad)
+        sess.headers.update({"User-Agent": "ProteoGenDB/2.2 (requests)"})
+        return sess
+
+    def _sleep_jitter(base):
+        time.sleep(base + random.random() * 0.5)
+
     seq_records = []
     mode = args[0][0]
+    session = _make_session()
 
     if mode == "ncbi":
+        base_url = "https://www.ncbi.nlm.nih.gov/search/api/download-sequence/?db=protein&id={pid}&filename={pid}"
         for i_pid, pid in enumerate(pids):
-            # ToDo: check if temp database entry exists if not get from NCBI and write to disk
-            base_url = "https://www.ncbi.nlm.nih.gov/search/api/download-sequence/?db=protein&id={pid}&filename={pid}"
-            prot_seq_rec = SeqIO.read(io.StringIO(requests.get(base_url.format(pid=pid)).text), "fasta").seq
-            seq_records.append(prot_seq_rec)
+            got = False
+            for attempt in range(6):
+                try:
+                    resp = session.get(base_url.format(pid=pid), timeout=20)
+                    txt = (resp.text or "")
+                    # FASTA must start with ">"
+                    if resp.ok and txt.lstrip().startswith(">"):
+                        try:
+                            prot_seq_rec = SeqIO.read(io.StringIO(txt), "fasta").seq
+                            seq_records.append(prot_seq_rec)
+                            got = True
+                            break
+                        except Exception:
+                            # sometimes NCBI returns an empty FASTA stub -> retry
+                            pass
+                    # retry on anything else
+                except requests.exceptions.RequestException as e:
+                    # network hiccup -> backoff and retry
+                    log.warning(f"{pid}: NCBI fetch error ({type(e).__name__}). Retry {attempt+1}/6")
+                _sleep_jitter(1.0 * (attempt + 1))
+            if not got:
+                log.error(f"{pid}: NCBI FASTA fetch failed after retries. Yielding empty sequence.")
+                seq_records.append(Seq(""))
             p_bar_val[jid] = i_pid
+
     elif mode == "ncbi_NM":
-        ncbi_api_key = args[0][1]
+        # EFetch protein translation from NM_... transcripts
         efetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+        ncbi_api_key = args[0][1]
         for i_pid, pid in enumerate(pids):
-            ncbi_api_status = True
-            while ncbi_api_status:
+            got = False
+            for attempt in range(6):
                 try:
                     params = {
                         "db": "nucleotide",
                         "id": pid,
                         "rettype": "fasta_cds_aa",
-                        "retmode": "xml",
-                        "api_key": ncbi_api_key
+                        "retmode": "xml",   # response is text containing FASTA blocks
                     }
-                    response = requests.get(efetch_url, params=params)
-
-                    # extract the translated sequence
-                    translated_seq = ''.join(response.text.split("\n")[1:])
-                    prot_seq_rec = Seq(translated_seq)
-                    seq_records.append(prot_seq_rec)
-                    # when response 429 (rate limit), 500 (server error), .. log error
-                    if response.status_code != 200:
-                        log.error(f"{pid}: Error fetching sequences from NCBI! - retry..")
-                    else:
-                        ncbi_api_status = False
-                    # small delay when no API key to avoid rate limiting
-                    if ncbi_api_key == "":
-                        sleep(5)
-                    else:
-                        sleep(2)
-                except Exception as e:
-                    log.error(f"Error fetching sequence for {pid}: {str(e)}")
+                    if ncbi_api_key:
+                        params["api_key"] = ncbi_api_key
+                    resp = session.get(efetch_url, params=params, timeout=30)
+                    txt = (resp.text or "").strip()
+                    # very defensive: grab anything after first header line if present
+                    if resp.ok and ">" in txt:
+                        # concatenate all lines except headers -> amino-acid sequence(s), pick first CDS
+                        lines = [ln.strip() for ln in txt.splitlines()]
+                        # find first FASTA block
+                        block = []
+                        in_block = False
+                        for ln in lines:
+                            if ln.startswith(">"):
+                                if block:
+                                    break
+                                in_block = True
+                                continue
+                            if in_block and ln:
+                                block.append(ln)
+                        translated_seq = "".join(block)
+                        if translated_seq:
+                            seq_records.append(Seq(translated_seq))
+                            got = True
+                            break
+                    # retry otherwise
+                except requests.exceptions.RequestException as e:
+                    log.warning(f"{pid}: EFetch error ({type(e).__name__}). Retry {attempt+1}/6")
+                # rate limits
+                _sleep_jitter(2.0 if ncbi_api_key else 5.0)
+            if not got:
+                log.error(f"{pid}: EFetch failed after retries. Yielding empty sequence.")
+                seq_records.append(Seq(""))
             p_bar_val[jid] = i_pid
+
     elif mode == "uniprot":
+        # EBI Proteins API JSON chunked by 100 accessions
         pid_list = [pids[i:i + 100] for i in range(0, len(pids), 100)]
-        pid_num = 0
-
-        for i_pid, pids in enumerate(pid_list):
-            pids_str = ",".join(pids)
+        fetched = 0
+        for chunk_idx, chunk_ids in enumerate(pid_list):
+            pids_str = ",".join(chunk_ids)
             base_url = "https://www.ebi.ac.uk/proteins/api/proteins?offset=0&size=100&accession={pids}"
-            seq_response = requests.get(base_url.format(pids=pids_str),
-                                        headers={"Accept": "application/json"},
-                                        timeout=10).text
-            seq_json = json.loads(seq_response)
+            got = False
+            for attempt in range(6):
+                try:
+                    resp = session.get(
+                        base_url.format(pids=pids_str),
+                        headers={"Accept": "application/json"},
+                        timeout=30
+                    )
+                    if not resp.ok:
+                        raise requests.exceptions.RequestException(f"HTTP {resp.status_code}")
+                    # JSON can be incomplete on transient failures
+                    try:
+                        seq_json = resp.json()
+                    except Exception:
+                        # retry JSON decoding issues
+                        raise requests.exceptions.RequestException("JSON decode error")
+                    # sort by request order
+                    try:
+                        seq_json = sorted(seq_json, key=lambda k: chunk_ids.index(k['accession']))
+                    except Exception:
+                        pass
+                    for seq in seq_json:
+                        seq_header = f">sp|{seq.get('accession','')}|{seq.get('id','')}\n"
+                        seq_str = (seq.get("sequence") or {}).get("sequence") or ""
+                        if not seq_str:
+                            seq_records.append(Seq(""))
+                        else:
+                            try:
+                                prot_seq_rec = SeqIO.read(io.StringIO(seq_header + seq_str), "fasta").seq
+                                seq_records.append(prot_seq_rec)
+                            except Exception:
+                                seq_records.append(Seq(seq_str))
+                    got = True
+                    break
+                except requests.exceptions.RequestException as e:
+                    log.warning(f"UniProt chunk {chunk_idx+1}/{len(pid_list)} error ({type(e).__name__}). Retry {attempt+1}/6")
+                    _sleep_jitter(1.0 * (attempt + 1))
+            if not got:
+                log.error(f"UniProt chunk {chunk_idx+1}: failed after retries. Filling chunk with empty sequences.")
+                # keep output length aligned with input
+                for _ in chunk_ids:
+                    seq_records.append(Seq(""))
 
-            # sort seq_json by order in pids
-            seq_json = sorted(seq_json, key=lambda k: pids.index(k['accession']))
+            fetched += len(chunk_ids)
+            p_bar_val[jid] = fetched
 
-            for seq in seq_json:
-                seq_header = ">sp|{}|{}\n".format(
-                    seq["accession"],
-                    seq["id"]
-                )
-                seq_str = seq["sequence"]["sequence"]
-                prot_seq_rec = SeqIO.read(io.StringIO(seq_header + seq_str), "fasta").seq
-                seq_records.append(prot_seq_rec)
-
-            pid_num += len(pid_list[i_pid])
-            p_bar_val[jid] = pid_num
+    # finalize to shared manager dict
     seq_records_df = pd.Series(seq_records)
 
     df_status[jid] = seq_records_df
