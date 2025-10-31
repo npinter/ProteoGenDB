@@ -1911,6 +1911,7 @@ SOURCE_SPECS: List[SourceSpec] = [
     SourceSpec("map_uniprot", load_uniprot,"UniProtID mutations",  "uniprot"),
     SourceSpec("map_enst", load_enst, "ENST mutations", "enst"),
     SourceSpec("map_illumina_json", load_illumina_json, "Illumina Connected Annotations", "illumina_json"),
+    SourceSpec("map_vep_json", load_vep_json, "Ensembl VEP JSON", "vep_json"),
 ]
 
 
