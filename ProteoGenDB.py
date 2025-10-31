@@ -61,7 +61,7 @@ def print_welcome():
  |_|   |_|  \___/ \__\___|\___/ \_____|\___|_| |_|_____/|____/                              
 """)
     log.info(" Niko Pinter - https://github.com/npinter/ProteoGenDB")
-    log.info(" v2.2.2 \n")
+    log.info(" v2.3.0 \n")
 
 
 def multi_process(func, input_df, unit, *args):

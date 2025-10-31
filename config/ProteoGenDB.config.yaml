@@ -1,4 +1,4 @@
-#v2.2.2
+#v2.3.0
 
 # General
 num_jobs: 16                                                                              # TSO500: 10, SAAVs: 24, COSMIC: 24
