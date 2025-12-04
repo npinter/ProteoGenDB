@@ -34,16 +34,32 @@ from tqdm import tqdm
 global start_time
 
 LOG_LEVEL   = logging.DEBUG
-LOGFORMAT   = "%(log_color)s%(asctime)s %(message)s%(reset)s"
-LOGFORMAT_W = "%(log_color)s%(message)s%(reset)s"
+LOGFORMAT   = "%(log_color)s%(asctime)s [%(levelname)s] %(message)s%(reset)s"
+LOGFORMAT_W = "%(log_color)s[%(levelname)s] %(message)s%(reset)s"
 
-stream = logging.StreamHandler()
-stream.setLevel(LOG_LEVEL)
-stream.setFormatter(ColoredFormatter(LOGFORMAT_W))
-log = logging
-log.getLogger().setLevel(logging.INFO)
-log.getLogger("requests").setLevel(logging.WARNING)
-log.getLogger().addHandler(stream)
+log = logging.getLogger("ProteoGenDB")
+log.setLevel(LOG_LEVEL)
+log.propagate = False
+
+# avoid duplicate handlers if module is imported multiple times
+for h in list(log.handlers):
+    log.removeHandler(h)
+
+# INFO & DEBUG -> stdout
+stdout_handler = logging.StreamHandler(sys.stdout)
+stdout_handler.setLevel(logging.INFO)
+stdout_handler.setFormatter(ColoredFormatter(LOGFORMAT_W))
+
+# WARNING & ERROR -> stderr
+stderr_handler = logging.StreamHandler(sys.stderr)
+stderr_handler.setLevel(logging.WARNING)
+stderr_handler.setFormatter(ColoredFormatter(LOGFORMAT_W))
+
+log.addHandler(stdout_handler)
+log.addHandler(stderr_handler)
+
+# keep 3rd-party libs quiet
+logging.getLogger("requests").setLevel(logging.WARNING)
 
 # Suppress SettingWithCopyWarning & PerformanceWarning
 pd.options.mode.chained_assignment = None
@@ -1932,7 +1948,8 @@ def main() -> None:
 
     # welcome banner
     print_welcome()
-    stream.setFormatter(ColoredFormatter(LOGFORMAT, "%H:%M:%S"))
+    for h in log.handlers:
+        h.setFormatter(ColoredFormatter(LOGFORMAT, "%H:%M:%S"))
 
     cfg = read_yaml(args.config_yaml)
     out_dir = os.path.dirname(args.config_yaml)
