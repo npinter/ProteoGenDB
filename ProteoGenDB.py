@@ -1170,6 +1170,10 @@ def convert_df_to_bio_list(pd_seq, seq_format, min_pep_len=None, max_pep_len=Non
                     var_seq_last = var_seq
                     var_pos_last = var_pos
 
+        if not seq_records:
+            log.error("No valid variant peptides found for FASTA output! Exiting..")
+            sys.exit(1)
+
         if not keep_dups:
             # this will keep only the first occurance of a peptide
             dup_ids = pd.DataFrame(seq_dups).sort_values(by=0).duplicated(keep="first").sort_index().tolist()
