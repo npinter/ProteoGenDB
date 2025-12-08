@@ -33,6 +33,8 @@ from tqdm import tqdm
 
 global start_time
 
+VERSION = "2.3.3"
+
 LOG_LEVEL   = logging.DEBUG
 LOGFORMAT   = "%(log_color)s%(asctime)s [%(levelname)s] %(message)s%(reset)s"
 LOGFORMAT_W = "%(log_color)s[%(levelname)s] %(message)s%(reset)s"
@@ -69,16 +71,21 @@ warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
 def print_welcome():
     if platform.system() == 'Windows':
         os.system("color")
-    log.info(r"""
+    banner = r"""
   _____           _              _____            _____  ____  
  |  __ \         | |            / ____|          |  __ \|  _ \ 
  | |__) | __ ___ | |_ ___  ___ | |  __  ___ _ __ | |  | | |_) |
  |  ___/ '__/ _ \| __/ _ \/ _ \| | |_ |/ _ \ '_ \| |  | |  _ < 
  | |   | | | (_) | ||  __/ (_) | |__| |  __/ | | | |__| | |_) |
  |_|   |_|  \___/ \__\___|\___/ \_____|\___|_| |_|_____/|____/                              
-""")
-    log.info(" Niko Pinter - https://github.com/npinter/ProteoGenDB")
-    log.info(" v2.3.2 \n")
+"""
+    author = "Niko Pinter - https://github.com/npinter/ProteoGenDB"
+
+    sys.stdout.write(
+        banner + "\n" +
+        author + "\n" +
+        "v" + VERSION + "\n"
+    )
 
 
 def multi_process(func, input_df, unit, *args):
