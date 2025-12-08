@@ -456,7 +456,7 @@ def get_uniprot_id(ids, fmt_from="Ensembl_Protein", fmt_to="UniProtKB", ens_sub=
                 response.append(json.loads(requests.post("{}/run".format(base_url), data=data).text)["jobId"])
                 key_error = False
             except KeyError:
-                log.error("UniProt connection error.. retry..")
+                log.warning("UniProt connection error.. retry..")
                 sleep(10)
 
     result_df = pd.DataFrame()
@@ -473,13 +473,13 @@ def get_uniprot_id(ids, fmt_from="Ensembl_Protein", fmt_to="UniProtKB", ens_sub=
                     uni_data = json.loads(requests.get("{}/stream/{}".format(base_url, uni_job)).text)
                     err_json = False
                 except json.decoder.JSONDecodeError:
-                    log.error("Request failed.. retry..")
+                    log.warning("Request failed.. retry..")
                     sleep(1)
             try:
                 result_df = pd.concat([result_df, pd.DataFrame(uni_data["results"])])
                 err_result = False
             except KeyError:
-                log.error("Waiting for results..")
+                log.warning("Waiting for results..")
                 err_json = True
                 sleep(5)
 
@@ -548,7 +548,7 @@ def fetch_fasta(pids, df_status, jid, p_bar_val, *args):
                     log.warning(f"{pid}: NCBI fetch error ({type(e).__name__}). Retry {attempt+1}/6")
                 _sleep_jitter(1.0 * (attempt + 1))
             if not got:
-                log.error(f"{pid}: NCBI FASTA fetch failed after retries. Yielding empty sequence.")
+                log.warning(f"{pid}: NCBI FASTA fetch failed after retries. Yielding empty sequence.")
                 seq_records.append(Seq(""))
             p_bar_val[jid] = i_pid
 
@@ -596,7 +596,7 @@ def fetch_fasta(pids, df_status, jid, p_bar_val, *args):
                 # rate limits
                 _sleep_jitter(2.0 if ncbi_api_key else 5.0)
             if not got:
-                log.error(f"{pid}: EFetch failed after retries. Yielding empty sequence.")
+                log.warning(f"{pid}: EFetch failed after retries. Yielding empty sequence.")
                 seq_records.append(Seq(""))
             p_bar_val[jid] = i_pid
 
@@ -645,7 +645,7 @@ def fetch_fasta(pids, df_status, jid, p_bar_val, *args):
                     log.warning(f"UniProt chunk {chunk_idx+1}/{len(pid_list)} error ({type(e).__name__}). Retry {attempt+1}/6")
                     _sleep_jitter(1.0 * (attempt + 1))
             if not got:
-                log.error(f"UniProt chunk {chunk_idx+1}: failed after retries. Filling chunk with empty sequences.")
+                log.warning(f"UniProt chunk {chunk_idx+1}: failed after retries. Filling chunk with empty sequences.")
                 # keep output length aligned with input
                 for _ in chunk_ids:
                     seq_records.append(Seq(""))
