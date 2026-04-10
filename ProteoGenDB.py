@@ -410,6 +410,7 @@ AA_CODE_MAP = {
     "Ala": "A", "Val": "V", "Glu": "E", "Tyr": "Y", "Met": "M",
     "Ter": "*", "del": "-"
 }
+
 AA_CODE_REGEX = re.compile("|".join(sorted(AA_CODE_MAP, key=len, reverse=True)))
 SIMPLE_VARIANT_RE = re.compile(r"^([A-Z])(\d+)([A-Z\*\-])$")
 UNSUPPORTED_VARIANT_TOKENS = ("delins", "ins", "dup", "fs", "ext", "sec", "?")
@@ -495,6 +496,105 @@ def parse_simple_variant(value: object) -> Optional[Tuple[str, int, str]]:
         return None
 
     return match.group(1), int(match.group(2)), match.group(3)
+
+
+def get_disease_annotation_filter_columns(cfg: dict) -> List[str]:
+    raw = cfg.get("disease_annotation_filter_columns")
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+
+    cols = []
+    seen = set()
+    for col in raw:
+        if col is None:
+            continue
+        col_str = str(col).strip()
+        if col_str and col_str not in seen:
+            cols.append(col_str)
+            seen.add(col_str)
+
+    return cols
+
+
+def filter_disease_annotation_rows(ann_df: pd.DataFrame, filter_cols: List[str]) -> pd.DataFrame:
+    if ann_df.empty or not filter_cols:
+        return ann_df
+
+    valid_cols = [col for col in filter_cols if col in ann_df.columns]
+    missing_cols = [col for col in filter_cols if col not in ann_df.columns]
+
+    if missing_cols:
+        log.warning(f"Disease annotation filter columns not present in output: {missing_cols}")
+    if not valid_cols:
+        log.warning("No valid disease annotation filter columns found. Skipping disease annotation filtering.")
+        return ann_df
+
+    mask = pd.Series(False, index=ann_df.index)
+    for col in valid_cols:
+        col_values = ann_df[col]
+        mask |= col_values.notna() & col_values.ne("NA") & col_values.ne("")
+
+    out_df = ann_df[mask].reset_index(drop=True)
+    log.info(
+        f"Disease annotation filter kept {len(out_df)}/{len(ann_df)} rows using columns {valid_cols}.."
+    )
+    return out_df
+
+
+def filter_source_df_by_annotation_rows(src_df: pd.DataFrame, ann_df: pd.DataFrame) -> pd.DataFrame:
+    if src_df.empty or ann_df.empty:
+        return src_df.iloc[0:0].copy()
+
+    allowed = set(
+        zip(
+            ann_df["UniProtID"].astype(str),
+            ann_df["VariantPos"].astype(str),
+            ann_df["VarSeqCleave"].astype(str)
+        )
+    )
+
+    rows = []
+    for _, row in src_df.iterrows():
+        pep_map = row["VarSeqCleave"][0] if isinstance(row.get("VarSeqCleave"), list) and row["VarSeqCleave"] else {}
+        if not isinstance(pep_map, dict) or not pep_map:
+            continue
+
+        seq_map = row["VarSeq"][0] if isinstance(row.get("VarSeq"), list) and row["VarSeq"] else {}
+        rel_map = row["RelPosMap"][0] if isinstance(row.get("RelPosMap"), list) and row["RelPosMap"] else {}
+        variant_list = row["VariantPos"] if isinstance(row.get("VariantPos"), list) else list(pep_map.keys())
+
+        keep_pep = {}
+        keep_seq = {}
+        keep_rel = {}
+
+        for var_pos in variant_list:
+            pep = pep_map.get(var_pos)
+            if pep is None:
+                continue
+            if (str(row["UniProtID"]), str(var_pos), str(pep)) not in allowed:
+                continue
+
+            keep_pep[var_pos] = pep
+            if isinstance(seq_map, dict) and var_pos in seq_map:
+                keep_seq[var_pos] = seq_map[var_pos]
+            if isinstance(rel_map, dict) and var_pos in rel_map:
+                keep_rel[var_pos] = rel_map[var_pos]
+
+        if not keep_pep:
+            continue
+
+        row_out = row.copy()
+        row_out["VariantPos"] = [var_pos for var_pos in variant_list if var_pos in keep_pep]
+        row_out["VarSeqCleave"] = [keep_pep]
+        if "VarSeq" in src_df.columns:
+            row_out["VarSeq"] = [keep_seq]
+        if "RelPosMap" in src_df.columns:
+            row_out["RelPosMap"] = [keep_rel]
+        rows.append(row_out)
+
+    return pd.DataFrame(rows).reset_index(drop=True)
 
 
 def get_uniprot_id(ids, fmt_from="Ensembl_Protein", fmt_to="UniProtKB", ens_sub=False, split_str="_"):
@@ -1962,8 +2062,21 @@ def run_source_pipeline(src_df: pd.DataFrame,
                                            cfg["annotation_data"],
                                            cfg["min_spec_pep_len"],
                                            cfg["max_spec_pep_len"])
-        src_df_out.to_csv(os.path.join(out_dir,
-                        f"{ts}_disease_annotation_{tag}.tsv"), sep="\t")
+
+        disease_filter_cols = get_disease_annotation_filter_columns(cfg)
+
+        if disease_filter_cols:
+            src_df_out = filter_disease_annotation_rows(src_df_out, disease_filter_cols)
+            src_df = filter_source_df_by_annotation_rows(src_df, src_df_out)
+            if src_df.empty:
+                log.warning(
+                    f"{description}: no peptides remain after disease annotation filtering "
+                    f"({disease_filter_cols})."
+                )
+
+        if cfg["add_disease_info"]:
+            src_df_out.to_csv(os.path.join(out_dir,
+                            f"{ts}_disease_annotation_{tag}.tsv"), sep="\t")
 
     # make fasta records
     recs = convert_df_to_bio_list(src_df, seq_fmt,

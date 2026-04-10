@@ -15,6 +15,7 @@ ncbi_api_key: ""                                                                
 
 # Disease info & variant filtering
 add_disease_info: True                                                                    # add disease information from EBI variants to FASTA header of variants
+disease_annotation_filter_columns: ["sig_likely_patho", "sig_patho"]                      # keep only SAAV peptides with a hit (!= NA) in any of these disease annotation columns, set [] to disable
 variant_reviewed_filter: ["UniProt"]                                                      # if list entry is present, only reviewed entries will be reported, keep empty ([]) to report all (Example ['Ensembl', 'ClinVar', 'UniProt', 'ClinGen', 'dbSNP', 'ExAC', 'gnomAD'])
 variant_evidences_cutoff: 0                                                               # if set to 0, no evidence filter is applied, otherwise only variants with at least the given number of evidences will be reported
 
