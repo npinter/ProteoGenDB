@@ -33,7 +33,7 @@ from tqdm import tqdm
 
 global start_time
 
-VERSION = "2.3.3"
+VERSION = "2.3.4"
 
 LOG_LEVEL   = logging.DEBUG
 LOGFORMAT   = "%(log_color)s%(asctime)s [%(levelname)s] %(message)s%(reset)s"
