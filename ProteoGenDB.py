@@ -390,27 +390,111 @@ def read_tso(tso_path):
     # inframe deletion: Pro129del |del
     tso_df["VariantPos3"] = tso_df["P-Dot Notation"].str.extract(r"p\.\(([A-z]{3}\d+(?:[A-z]{3}|Ter|del))\)")
 
-    aa_dict = {
-        'Cys': 'C', 'Asp': 'D', 'Ser': 'S', 'Gln': 'Q', 'Lys': 'K',
-        'Ile': 'I', 'Pro': 'P', 'Thr': 'T', 'Phe': 'F', 'Asn': 'N',
-        'Gly': 'G', 'His': 'H', 'Leu': 'L', 'Arg': 'R', 'Trp': 'W',
-        'Ala': 'A', 'Val': 'V', 'Glu': 'E', 'Tyr': 'Y', 'Met': 'M',
-        'Ter': '*', 'del': '-'
-    }
-    aa_regex = "|".join(aa_dict.keys())
+    # translate into one-letter code, keep only simple supported variants
+    tso_df["VariantPos"] = tso_df["VariantPos3"].apply(clean_variant_pos_list)
 
-    # translate into one-letter code and change to list
-    tso_df["VariantPos"] = tso_df["VariantPos3"].str.replace(
-        aa_regex, lambda x: aa_dict[x.group()], regex=True
-    ).apply(lambda x: [x])
-
-    # drop na
+    # drop na / unsupported variants
     tso_df = tso_df[~tso_df["VariantPos3"].isna()].reset_index(drop=True)
+    tso_df = tso_df[tso_df["VariantPos"].str.len() > 0].reset_index(drop=True)
 
     # get protein sequence from NCBI as SeqRecord
     tso_df["Sequence"] = multi_process("fetch_fasta", tso_df["ProteinID"].tolist(), "ids", "ncbi")
 
     return tso_df
+
+
+AA_CODE_MAP = {
+    "Cys": "C", "Asp": "D", "Ser": "S", "Gln": "Q", "Lys": "K",
+    "Ile": "I", "Pro": "P", "Thr": "T", "Phe": "F", "Asn": "N",
+    "Gly": "G", "His": "H", "Leu": "L", "Arg": "R", "Trp": "W",
+    "Ala": "A", "Val": "V", "Glu": "E", "Tyr": "Y", "Met": "M",
+    "Ter": "*", "del": "-"
+}
+AA_CODE_REGEX = re.compile("|".join(sorted(AA_CODE_MAP, key=len, reverse=True)))
+SIMPLE_VARIANT_RE = re.compile(r"^([A-Z])(\d+)([A-Z\*\-])$")
+UNSUPPORTED_VARIANT_TOKENS = ("delins", "ins", "dup", "fs", "ext", "sec", "?")
+
+
+def translate_aa_codes(value: object) -> Optional[str]:
+    if value is None or pd.isna(value):
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    text = re.sub(r"^p\.\(?", "", text, flags=re.IGNORECASE).rstrip(")")
+    text = AA_CODE_REGEX.sub(lambda m: AA_CODE_MAP[m.group(0)], text)
+    text = text.replace("X", "*")
+
+    return text or None
+
+
+def normalize_variant_pos(value: object) -> Optional[str]:
+    text = translate_aa_codes(value)
+    if not text:
+        return None
+
+    low = text.lower()
+    if "none" in low or "_" in text:
+        return None
+    if any(token in low for token in UNSUPPORTED_VARIANT_TOKENS):
+        return None
+    if not SIMPLE_VARIANT_RE.fullmatch(text):
+        return None
+
+    return text
+
+
+def clean_variant_pos_list(values: object) -> List[str]:
+    if values is None:
+        return []
+
+    if isinstance(values, (list, tuple, set, pd.Series, np.ndarray)):
+        raw_values = values
+    else:
+        if pd.isna(values):
+            return []
+        raw_values = [values]
+
+    cleaned = []
+    seen = set()
+
+    for value in raw_values:
+        norm = normalize_variant_pos(value)
+        if norm and norm not in seen:
+            cleaned.append(norm)
+            seen.add(norm)
+
+    return cleaned
+
+
+def clean_variant_pos_column(df: pd.DataFrame, column: str = "VariantPos") -> pd.DataFrame:
+    if column not in df.columns or df.empty:
+        return df
+
+    out_df = df.copy()
+    before = len(out_df)
+    out_df[column] = out_df[column].apply(clean_variant_pos_list)
+    out_df = out_df[out_df[column].str.len() > 0].reset_index(drop=True)
+    dropped = before - len(out_df)
+
+    if dropped:
+        log.info(f"Dropped {dropped} rows with unsupported {column} entries..")
+
+    return out_df
+
+
+def parse_simple_variant(value: object) -> Optional[Tuple[str, int, str]]:
+    text = normalize_variant_pos(value)
+    if not text:
+        return None
+
+    match = SIMPLE_VARIANT_RE.fullmatch(text)
+    if not match:
+        return None
+
+    return match.group(1), int(match.group(2)), match.group(3)
 
 
 def get_uniprot_id(ids, fmt_from="Ensembl_Protein", fmt_to="UniProtKB", ens_sub=False, split_str="_"):
@@ -991,25 +1075,29 @@ def process_mutation(df, df_status, jid, p_bar_val, *args):
     df["SequenceMut"] = None
 
     for i_seq, seq in df.iterrows():
-        var_pos = int(seq.VariantPos[0][1:-1])
-        var_sub = seq.VariantPos[0][-1]
-        var_aa = seq.VariantPos[0][0]
+        parsed_variant = parse_simple_variant(seq.VariantPos[0] if seq.VariantPos else None)
+        if not parsed_variant:
+            df.at[i_seq, "SequenceMut"] = Seq("")
+            p_bar_val[jid] = i_seq
+            continue
+
+        var_aa, var_pos, var_sub = parsed_variant
 
         # keep only variants where consensus AA occurs is in sequence
         # --> missmatch of mapped sequence (ENSEMBL (read_fasta, "ensembl") or NCBI (fetch_fasta)
         if len(seq.Sequence) < var_pos:
             # drop sequence if variant position is out of range
-            df["SequenceMut"].loc[i_seq] = Seq("")
+            df.at[i_seq, "SequenceMut"] = Seq("")
         else:
             if seq.Sequence[var_pos - 1:var_pos][0] == var_aa:
                 if not var_sub == "-" and not var_sub == "*":
-                    df["SequenceMut"].loc[i_seq] = seq.Sequence[:var_pos - 1] + var_sub + seq.Sequence[var_pos:]
+                    df.at[i_seq, "SequenceMut"] = seq.Sequence[:var_pos - 1] + var_sub + seq.Sequence[var_pos:]
                 elif var_sub == "*":
-                    df["SequenceMut"].loc[i_seq] = seq.Sequence[:var_pos - 1]
+                    df.at[i_seq, "SequenceMut"] = seq.Sequence[:var_pos - 1]
                 elif var_sub == "-":
-                    df["SequenceMut"].loc[i_seq] = seq.Sequence[:var_pos - 1] + seq.Sequence[var_pos:]
+                    df.at[i_seq, "SequenceMut"] = seq.Sequence[:var_pos - 1] + seq.Sequence[var_pos:]
                 else:
-                    df["SequenceMut"].loc[i_seq] = Seq("")
+                    df.at[i_seq, "SequenceMut"] = Seq("")
 
         # update progress bar
         p_bar_val[jid] = i_seq
@@ -1532,18 +1620,7 @@ def load_uniprot(cfg: dict) -> Tuple[pd.DataFrame, str, str, str, str]:
                                                   "DL_ftID":"VariantID"}).drop(columns="Identifier")
     anns = anns[["UniProtID","VariantPos","VariantID","Sequence"]]
 
-    # drop empty list in VariantPos
-    anns = anns[anns["VariantPos"].str.len() > 0]
-
-    # drop entries with A123None or None123A in VariantPos (fix for None values)
-    anns = anns[~anns["VariantPos"].apply(lambda x: any(
-        [v.startswith("None") or v.endswith("None") for v in x]
-    ))]
-
-    # drop entries with A16AA or EP16A in VariantPos (multiple like APG188E or E188APG as well)
-    anns = anns[~anns["VariantPos"].apply(lambda x: any(
-        [re.match(r"^[A-Z]{2,4}\d+[A-Z]{1,4}$", v) or re.match(r"^[A-Z]{1,4}\d+[A-Z]{2,4}$", v) for v in x]
-    ))]
+    anns = clean_variant_pos_column(anns)
 
     return anns, "GeneID", "uniprot_mut", "UniProt mutations", "variants"
 
@@ -1620,20 +1697,8 @@ def load_illumina_json(cfg: dict) -> Tuple[pd.DataFrame, str, str, str, str]:
     if df.empty:
         return pd.DataFrame(), "", "", "", ""
 
-    aa_dict = {
-        'Cys': 'C', 'Asp': 'D', 'Ser': 'S', 'Gln': 'Q', 'Lys': 'K',
-        'Ile': 'I', 'Pro': 'P', 'Thr': 'T', 'Phe': 'F', 'Asn': 'N',
-        'Gly': 'G', 'His': 'H', 'Leu': 'L', 'Arg': 'R', 'Trp': 'W',
-        'Ala': 'A', 'Val': 'V', 'Glu': 'E', 'Tyr': 'Y', 'Met': 'M',
-        'Ter': '*', 'del': '-'
-    }
-    aa_regex = "|".join(aa_dict.keys())
-
-    df["VariantPos"] = (
-        df["VariantPos3"]
-        .str.replace(aa_regex, lambda x: aa_dict[x.group()], regex=True)
-        .apply(lambda s: [s])
-    )
+    df["VariantPos"] = df["VariantPos3"].apply(clean_variant_pos_list)
+    df = df[df["VariantPos"].str.len() > 0].reset_index(drop=True)
 
     # map ProteinID -> UniProtID
     ensp_ids = df[df.ProteinID.str.startswith("ENSP", na=False)]["ProteinID"].drop_duplicates().tolist()
@@ -1744,15 +1809,6 @@ def load_vep_json(cfg: dict) -> Tuple[pd.DataFrame, str, str, str, str]:
         m = re.search(r"p\.\(?([A-Za-z]{3}(?:_[A-Za-z]{3}\d+)?\d+(?:[A-Za-z]{3}|Ter|del|dup))\)?", tail)
         return prot, m.group(1) if m else None
 
-    aa_dict = {
-        'Cys': 'C', 'Asp': 'D', 'Ser': 'S', 'Gln': 'Q', 'Lys': 'K',
-        'Ile': 'I', 'Pro': 'P', 'Thr': 'T', 'Phe': 'F', 'Asn': 'N',
-        'Gly': 'G', 'His': 'H', 'Leu': 'L', 'Arg': 'R', 'Trp': 'W',
-        'Ala': 'A', 'Val': 'V', 'Glu': 'E', 'Tyr': 'Y', 'Met': 'M',
-        'Ter': '*', 'del': '-'
-    }
-    aa_regex = "|".join(aa_dict.keys())
-
     rows: List[dict] = []
     for rec in root:
         try:
@@ -1777,8 +1833,9 @@ def load_vep_json(cfg: dict) -> Tuple[pd.DataFrame, str, str, str, str]:
             if "dup" in low:
                 continue
 
-            # convert three-letter AA codes -> one-letter
-            pos1 = re.sub(aa_regex, lambda m: aa_dict[m.group(0)], pos3)
+            pos1 = normalize_variant_pos(pos3)
+            if not pos1:
+                continue
 
             # build one row
             rows.append({
