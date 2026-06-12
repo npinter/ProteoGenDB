@@ -17,6 +17,7 @@ import platform
 import vcf
 import sqlite3
 from contextlib import closing
+from collections import Counter
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple, Union, List, cast
 from requests.adapters import HTTPAdapter
@@ -30,6 +31,17 @@ from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 from time import sleep
 from tqdm import tqdm
+
+try:
+    import orjson as _orjson
+except Exception:
+    _CACHE_JSON_LOADS = json.loads
+    _CACHE_JSON_DUMPS = json.dumps
+else:
+    _CACHE_JSON_LOADS = _orjson.loads
+
+    def _CACHE_JSON_DUMPS(value):
+        return _orjson.dumps(value).decode("utf-8")
 
 global start_time
 
@@ -861,46 +873,51 @@ def get_annotation_data(pids, df_status, jid, p_bar_val, *args):
     with closing(_sqlite_connect(db_path)) as con:
         _sqlite_init(con)
 
-        # Preload cache in chunks
+        unique_pids = list(dict.fromkeys(pids))
+        pid_counts = Counter(pids)
         cached: dict = {}
-        chunk = 900
-        for i in range(0, len(pids), chunk):
-            part = pids[i:i+chunk]
-            q = f"SELECT pid,data FROM cache WHERE pid IN ({','.join('?'*len(part))})"
-            for pid, data in con.execute(q, part).fetchall():
-                try:
-                    cached[pid] = json.loads(data)
-                except Exception:
-                    pass
+
+        con.execute("CREATE TEMP TABLE want(pid TEXT PRIMARY KEY)")
+        con.executemany("INSERT INTO want(pid) VALUES (?)", ((pid,) for pid in unique_pids))
+        for pid, data in con.execute(
+            "SELECT c.pid, c.data FROM cache c JOIN want w ON w.pid = c.pid"
+        ):
+            try:
+                cached[pid] = _CACHE_JSON_LOADS(data)
+            except Exception:
+                pass
+        con.execute("DROP TABLE want")
+
+        processed = sum(pid_counts[pid] for pid in cached)
+        p_bar_val[jid] = max(processed - 1, 0)
 
         now = int(time.time())
-        # Single pass over ALL pids to keep progress in sync
-        for i, pid in enumerate(pids):
-            if pid not in cached:
-                # fetch (retry on transient net issues)
-                while True:
-                    try:
-                        api_data = requests.get(api_url.format(pid=pid)).json()
-                        break
-                    except ConnectionError:
-                        log.error("UniProt REST API issue.. retry..")
-                        sleep(1)
-                # insert (tolerate brief locks)
-                for _ in range(8):
-                    try:
-                        con.execute(
-                            "INSERT OR IGNORE INTO cache(pid,data,ts) VALUES (?,?,?)",
-                            (pid, json.dumps(api_data), now)
-                        )
-                        break
-                    except sqlite3.OperationalError as e:
-                        if "locked" in str(e).lower():
-                            sleep(0.25)
-                            continue
-                        raise
-                cached[pid] = api_data
+        missing = [pid for pid in unique_pids if pid not in cached]
 
-            p_bar_val[jid] = i  # <- advance for every pid
+        if missing:
+            with requests.Session() as session:
+                for pid in missing:
+                    while True:
+                        try:
+                            api_data = session.get(api_url.format(pid=pid)).json()
+                            break
+                        except ConnectionError:
+                            log.warning("UniProt REST API issue.. retry..")
+                            sleep(1)
+                    for _ in range(8):
+                        try:
+                            con.execute(
+                                "INSERT OR REPLACE INTO cache(pid,data,ts) VALUES (?,?,?)",
+                                (pid, _CACHE_JSON_DUMPS(api_data), now)
+                            )
+                            break
+                        except sqlite3.OperationalError as e:
+                            if "locked" in str(e).lower():
+                                sleep(0.25); continue
+                            raise
+                    cached[pid] = api_data
+                    processed += pid_counts[pid]
+                    p_bar_val[jid] = max(processed - 1, 0)
 
         result_data = [cached.get(pid) for pid in pids]
 
