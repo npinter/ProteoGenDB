@@ -381,6 +381,128 @@ def write_fasta(df, out_path, time_str, fasta_type, in_src):
         SeqIO.write(df, fasta_file, "fasta")
 
 
+def config_path_is_set(path_value: object) -> bool:
+    if path_value is None:
+        return False
+    path_str = str(path_value).strip()
+    return bool(path_str) and path_str.lower() != "none"
+
+
+def get_reference_ids(cfg: dict) -> List[str]:
+    if "_reference_ids" in cfg:
+        return cfg["_reference_ids"]
+
+    if not config_path_is_set(cfg.get("reference_dataset")):
+        cfg["_reference_ids"] = []
+        cfg["_reference_id_count"] = 0
+        return []
+
+    with open(cfg["reference_dataset"]) as ref:
+        ref_df_sep = pd.read_table(ref, sep=None, iterator=True, engine="python")
+        ref_df_sep_det = ref_df_sep._engine.data.dialect.delimiter
+        ref_df = pd.read_table(cfg["reference_dataset"], sep=ref_df_sep_det)
+
+    if ref_df.empty or len(ref_df.columns) == 0:
+        reference_ids: List[str] = []
+    else:
+        first_col = ref_df.iloc[:, 0].dropna().astype(str).str.strip()
+        reference_ids = [
+            ref_id for ref_id in first_col
+            if ref_id and ref_id.lower() not in {"nan", "none"}
+            and ";" not in ref_id
+            and not ref_id.startswith("Biognosys")
+        ]
+        reference_ids = list(dict.fromkeys(reference_ids))
+
+    cfg["_reference_ids"] = reference_ids
+    cfg["_reference_id_count"] = len(reference_ids)
+    return reference_ids
+
+
+def get_reference_id_count(cfg: dict) -> int:
+    return len(get_reference_ids(cfg))
+
+
+def count_unique_values(df: pd.DataFrame, column: str) -> int:
+    if df.empty or column not in df.columns:
+        return 0
+    values = df[column].dropna().astype(str).str.strip()
+    values = values[(values != "") & (values != "NoUniID") & (values.str.lower() != "none")]
+    return int(values.nunique())
+
+
+def make_status_row(source: str,
+                    status: str,
+                    reason: str,
+                    input_records: int = 0,
+                    reference_ids: int = 0,
+                    matched_ids: int = 0,
+                    valid_peptides: int = 0,
+                    output_records: int = 0) -> dict:
+    return {
+        "source": source,
+        "status": status,
+        "reason": reason,
+        "input_records": input_records,
+        "reference_ids": reference_ids,
+        "matched_ids": matched_ids,
+        "valid_peptides": valid_peptides,
+        "output_records": output_records,
+    }
+
+
+def write_status_report(status_rows: List[dict], out_dir: str, time_str: str) -> None:
+    status_df = pd.DataFrame(status_rows, columns=[
+        "source",
+        "status",
+        "reason",
+        "input_records",
+        "reference_ids",
+        "matched_ids",
+        "valid_peptides",
+        "output_records"
+    ])
+    status_df.to_csv(os.path.join(out_dir, f"{time_str}_proteogendb_status.tsv"),
+                     sep="\t",
+                     index=False)
+
+
+def write_empty_disease_annotation(out_dir: str, time_str: str, in_src: str) -> None:
+    out_path = os.path.join(out_dir, f"{time_str}_disease_annotation_{in_src}.tsv")
+    if os.path.exists(out_path):
+        return
+    pd.DataFrame(columns=[
+        "UniProtID",
+        "VariantPos",
+        "VarSeqCleave",
+        "VarSeq",
+        "Annotated",
+        "ftID",
+        "ClinVarID",
+        "MAF",
+        "sig_patho",
+        "sig_likely_patho",
+        "sig_likely_benign",
+        "sig_benign",
+        "sig_uncertain",
+        "sig_conflict",
+        "disease_association"
+    ]).to_csv(out_path, sep="\t", index=False)
+
+
+def write_empty_source_outputs(cfg: dict, out_dir: str, time_str: str, in_src: str) -> None:
+    if cfg.get("add_disease_info", False):
+        write_empty_disease_annotation(out_dir, time_str, in_src)
+
+    write_fasta([], out_dir, time_str, "SAAV_sequences", in_src)
+
+    if cfg.get("generate_subFASTA", False):
+        write_fasta([], out_dir, time_str, "subFASTA", in_src)
+        write_fasta([], out_dir, time_str, "subFASTA_SAAV", in_src)
+    elif not config_path_is_set(cfg.get("reference_dataset")):
+        write_fasta([], out_dir, time_str, "FASTA_SAAV", in_src)
+
+
 def read_tso(tso_path):
     with open(tso_path, "r") as tso_input:
         tso_split = tso_input.read().split("[Small Variants]")[1][3:]
@@ -1400,8 +1522,8 @@ def convert_df_to_bio_list(pd_seq, seq_format, min_pep_len=None, max_pep_len=Non
                     var_pos_last = var_pos
 
         if not seq_records:
-            log.error("No valid variant peptides found for FASTA output! Exiting..")
-            sys.exit(1)
+            log.warning("No valid variant peptides found for FASTA output.")
+            return []
 
         if not keep_dups:
             # this will keep only the first occurance of a peptide
@@ -1597,7 +1719,7 @@ def load_cosmic(cfg: dict) -> Tuple[pd.DataFrame, str, str, str, str]:
 def load_tso(cfg: dict) -> Tuple[pd.DataFrame, str, str, str, str]:
     df = read_tso(cfg["tso_path"])
     if df.empty:
-        log.error("No variants in TSO data..")
+        log.warning("No variants in TSO data..")
         return pd.DataFrame(), "", "", "", ""
 
     # get UniProt IDs via NCBI ID
@@ -2019,16 +2141,41 @@ def run_source_pipeline(src_df: pd.DataFrame,
                         out_dir: str,
                         ts: str,
                         proc_mut_unit: str,
-                        proc_saavs_unit: str) -> None:
+                        proc_saavs_unit: str) -> dict:
+
+    input_records = len(src_df)
+    reference_id_count = int(cfg.get("_reference_id_count", 0))
+    matched_ids = count_unique_values(src_df, "UniProtID")
+
+    def no_result(reason: str, valid_peptides: int = 0) -> dict:
+        write_empty_source_outputs(cfg, out_dir, ts, tag)
+        log.warning(f"{description}: {reason.replace('_', ' ')} - no output peptides.")
+        return make_status_row(tag,
+                               "no_result",
+                               reason,
+                               input_records=input_records,
+                               reference_ids=reference_id_count,
+                               matched_ids=matched_ids,
+                               valid_peptides=valid_peptides,
+                               output_records=0)
 
     if src_df.empty:
-        log.warning(f"{description}: no data – skipped.")
-        return
+        return no_result("source_empty")
 
     # keep only proteins present in reference dataset (if requested)
-    if cfg["reference_dataset"]:
-        log.info("Filter UniProtIDs with reference dataset..")
-        src_df = filter_id_with_reference(src_df, cfg)
+    if config_path_is_set(cfg.get("reference_dataset")):
+        if seq_fmt == "isoform":
+            # list contains canonical roots; filter by Consensus
+            log.info("Filter isoforms by canonical IDs from reference dataset..")
+            src_df = filter_id_with_reference(src_df, cfg, column_str="Consensus")
+            matched_ids = count_unique_values(src_df, "Consensus")
+        else:
+            log.info("Filter UniProtIDs with reference dataset..")
+            src_df = filter_id_with_reference(src_df, cfg)
+            matched_ids = count_unique_values(src_df, "UniProtID")
+
+        if src_df.empty:
+            return no_result("no_reference_id_overlap")
 
     # if no reference list drop orphan IDs
     elif not cfg["filter_seq_with_reference_add_no_ids"]:
@@ -2037,6 +2184,14 @@ def run_source_pipeline(src_df: pd.DataFrame,
             "'filter_seq_with_reference_add_no_ids' is False – dropping NoUniID rows.")
         if "UniProtID" in src_df.columns:
             src_df = src_df[src_df["UniProtID"] != "NoUniID"]
+            matched_ids = count_unique_values(src_df, "UniProtID")
+        if src_df.empty:
+            return no_result("no_mapped_ids")
+
+    if seq_fmt not in {"isoform", "nterm"} and "VariantPos" in src_df.columns:
+        src_df = clean_variant_pos_column(src_df)
+        if src_df.empty:
+            return no_result("no_supported_simple_variants")
 
     # mutate sequences
     if proc_mut_unit:
@@ -2045,13 +2200,21 @@ def run_source_pipeline(src_df: pd.DataFrame,
                                src_df,
                                proc_mut_unit,
                                cfg)
+        if src_df.empty:
+            return no_result("no_valid_mutated_sequences")
 
     # process SAAVs
-    log.info("Processing mutations..")
-    src_df = multi_process("process_saavs",
-                           src_df,
-                           proc_saavs_unit,
-                           cfg)
+    if seq_fmt == "nterm":
+        # N-termini already provided as VarSeqCleave. No mutation/SAAV processing.
+        pass
+    else:
+        log.info("Processing mutations..")
+        src_df = multi_process("process_saavs",
+                               src_df,
+                               proc_saavs_unit,
+                               cfg)
+        if src_df.empty:
+            return no_result("no_valid_variant_sequences")
 
     # filter against the reference proteome
     proteome_available = bool(cfg.get("reference_proteome"))
@@ -2070,6 +2233,8 @@ def run_source_pipeline(src_df: pd.DataFrame,
                                  proteome, out_dir)
 
         src_df = pd.concat(cast(List[pd.DataFrame], [pd.read_hdf(p) for p in h5_paths]), ignore_index=True)
+        if src_df.empty:
+            return no_result("reference_proteome_filter_removed_all")
     elif proteome_available:
         proteome = prepare_reference_proteome(cfg)
 
@@ -2095,11 +2260,17 @@ def run_source_pipeline(src_df: pd.DataFrame,
             src_df_out.to_csv(os.path.join(out_dir,
                             f"{ts}_disease_annotation_{tag}.tsv"), sep="\t")
 
+        if src_df.empty:
+            return no_result("disease_annotation_filter_removed_all")
+
     # make fasta records
     recs = convert_df_to_bio_list(src_df, seq_fmt,
                                   cfg["min_spec_pep_len"],
                                   cfg["max_spec_pep_len"],
                                   cfg["keep_saav_dups_in_fasta"])
+
+    if not recs:
+        return no_result("no_valid_peptides")
 
     # write variant fasta
     log.info(f"Save {description} peptides as FASTA..")
@@ -2115,6 +2286,15 @@ def run_source_pipeline(src_df: pd.DataFrame,
         # optional standalone subproteome
         if cfg["generate_subFASTA"]:
             write_fasta(prot_recs, out_dir, ts, "subFASTA", tag)
+
+    return make_status_row(tag,
+                           "ok",
+                           "",
+                           input_records=input_records,
+                           reference_ids=reference_id_count,
+                           matched_ids=matched_ids,
+                           valid_peptides=len(recs),
+                           output_records=len(recs))
 
 SOURCE_SPECS: List[SourceSpec] = [
     SourceSpec("map_galaxy", load_galaxy, "Galaxy RNAseq mutations", "galaxy"),
@@ -2150,19 +2330,57 @@ def main() -> None:
     global config_yaml
     config_yaml = cfg
 
+    status_rows: List[dict] = []
+    reference_dataset_configured = config_path_is_set(cfg.get("reference_dataset"))
+    if reference_dataset_configured:
+        reference_id_count = get_reference_id_count(cfg)
+    else:
+        reference_id_count = 0
+        cfg["_reference_ids"] = []
+        cfg["_reference_id_count"] = 0
+
+    min_reference_ids = int(cfg.get("min_reference_ids", 1) or 0)
+    skip_due_to_reference_count = (
+        reference_dataset_configured
+        and min_reference_ids > 0
+        and reference_id_count < min_reference_ids
+    )
+
+    if skip_due_to_reference_count:
+        log.warning(
+            f"Reference dataset contains {reference_id_count} usable IDs; "
+            f"minimum for proteogenomics is {min_reference_ids}. "
+            "Skipping selected sources."
+        )
+
     # iterate over all sources
     for spec in SOURCE_SPECS:
         if not cfg.get(spec.cfg_flag, False):
             continue
 
+        if skip_due_to_reference_count:
+            write_empty_source_outputs(cfg, out_dir, ts, spec.tag)
+            status_rows.append(make_status_row(spec.tag,
+                                               "skipped",
+                                               "too_few_reference_ids",
+                                               reference_ids=reference_id_count))
+            continue
+
         log.info(f"Processing {spec.description} input..")
         df, join_key, seq_fmt, proc_mut_unit, proc_saavs_unit = spec.loader(cfg)
-        if df.empty:
-            log.warning(f"{spec.description}: no entries – nothing written.")
-            continue
-        run_source_pipeline(df, join_key, seq_fmt, spec.description, spec.tag, cfg, out_dir, ts, proc_mut_unit, proc_saavs_unit)
+        status_rows.append(run_source_pipeline(df,
+                                               join_key,
+                                               seq_fmt,
+                                               spec.description,
+                                               spec.tag,
+                                               cfg,
+                                               out_dir,
+                                               ts,
+                                               proc_mut_unit,
+                                               proc_saavs_unit))
 
     # tidy up and show total runtime
+    write_status_report(status_rows, out_dir, ts)
     shutil.rmtree(os.path.join(out_dir, "temp"), ignore_errors=True)
     mins = round((time.time() - start_time) / 60, 2)
     log.info(f"runtime (total): {mins} min")

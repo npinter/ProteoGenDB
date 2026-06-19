@@ -23,6 +23,7 @@ variant_evidences_cutoff: 0                                                     
 annotation_data: "./input/annotation/"                                                    # path to annotation data folder (for EBI API requests)
 fasta_ensembl: "./input/combined_Homo_sapiens.GRCh38.pep.all.fa"                          # ENSEMBL database, don't change (use ensembl_merger.py to generate one)
 reference_dataset: ""                                                                     # first search results
+min_reference_ids: 1                                                    # skip proteogenomic source processing if first search results contain fewer usable IDs, set 0 to disable
 reference_proteome: "./input/UP000005640_9606.fasta"                                      # reference proteome (subFASTA f.e.)
 generate_subFASTA: True                                                                   # generate subFASTA and append variant peptides to it
 

@@ -60,6 +60,8 @@ The `ProteoGenDB.config.yaml` file contains various parameters for controlling t
 
 Disease-annotation-based peptide filtering is controlled with `disease_annotation_filter_columns`. By default, ProteoGenDB keeps only SAAV peptides with a non-`NA` hit in either `sig_likely_patho` or `sig_patho`. Set the option to `[]` to disable this filter or provide a custom list from `sig_benign`, `sig_conflict`, `sig_likely_benign`, `sig_likely_patho`, `sig_patho`, and `sig_uncertain`.
 
+ProteoGenDB writes a `*_proteogendb_status.tsv` report for each run. If a reference dataset contains fewer usable IDs than `min_reference_ids`, selected sources are skipped, expected output files are created empty and the status report records `skipped` with reason `too_few_reference_ids`.
+
 ## Ensembl Merger
 
 The `ensembl_merger.py` script is designed to merge Ensembl protein sequence files from different releases into a single output file. The output file is a mandatory input for ProteoGenDB to map variants from the Galaxy Workflow output to UniProt IDs. This script is helpful when building a custom protein database containing sequences from multiple releases of the same organism.
