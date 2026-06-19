@@ -45,7 +45,7 @@ else:
 
 global start_time
 
-VERSION = "2.3.4"
+VERSION = "2.3.5"
 
 LOG_LEVEL   = logging.DEBUG
 LOGFORMAT   = "%(log_color)s%(asctime)s [%(levelname)s] %(message)s%(reset)s"
